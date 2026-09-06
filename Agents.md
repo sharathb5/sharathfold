@@ -1,0 +1,63 @@
+# cursor.md
+
+## What this is
+
+`fold` — a Go library for webhook delivery. A host app imports it, hands it an event and a list of subscriber URLs, and it handles delivery: in parallel across subscribers, in order per subscriber, with retries and durable storage.
+
+The one thing that makes it different: subscribers hash onto a fixed set of partitions, and each worker owns a slice of those partitions. A given subscriber always lands on the same worker, so their events go out in sequence, while other subscribers are delivered in parallel. Ordering and throughput at the same time, instead of one or the other.
+
+Everything else is table stakes. The ordering guarantee is the product.
+
+Design decisions and their rationale live in `DECISIONS.md`. Read it before proposing anything that contradicts it.
+
+## Layout
+
+```
+fold.go              New, Dispatcher, Dispatch, Start, Close, Resize, Config
+types.go             Event, Subscriber, DeliveryStatus
+options.go           Config fields / functional options
+worker.go            pool, claim loop, head-of-line interaction
+partition.go         hash, ownership map, resize/drain
+deliver.go           HTTP POST, timeouts, signing
+doc.go               package docs + ordering claim
+store/
+  store.go           Store interface + Delivery record
+  memory/            map + mutex default
+  postgres/          SKIP LOCKED implementation + schema.sql
+internal/
+  backoff/
+  hash/
+bench/
+  naive/             unordered baseline for comparison
+spike/               throwaway experiments; never imported by library code
+```
+
+Organized by responsibility, not by feature. Keep the root package small and host-facing.
+
+## Rules
+
+1. **Never serialize in the worker path.** The payload is encoded once in `Dispatch` and the bytes are read-only afterward. No `json.Marshal` in `worker.go` or `deliver.go`.
+2. **Never make HTTP calls on the `Dispatch` path.** The caller returns as soon as rows are written to the store. Delivery is the workers' job.
+3. **Never claim outside owned partitions, and never bypass the head-of-line gate.** A worker may only claim rows in partitions it owns, and only when no earlier-sequence delivery for that subscriber is still pending or in-flight. This is the ordering guarantee — a shortcut here silently breaks the entire premise of the project.
+4. **Never mark a delivery terminal without checking the generation stamp.** A worker drained during a resize must not complete work under a stale ownership map.
+5. **`store/postgres` and `store/memory` must not import the root package.** Storage backends stay optional so core stays light.
+6. **Commit incrementally as work lands.** Prefer many small, coherent commits over one huge commit at the end of a session. Each commit should be one feature, fix, or logical step — scoped and atomic — so history reads as a sequence of meaningful changes. Commit when a unit of work is done and makes sense on its own (e.g. store interface before the memory impl, memory before workers, workers before retries), not when the whole task is finished. No drive-by refactors bundled with functional changes.
+
+## Definition of done
+
+A change is not complete until the ordering test passes under concurrent load with zero per-subscriber inversions. Run it after any change to `worker.go`, `partition.go`, or either store implementation.
+
+Do not report a task as finished based on the code looking correct. Run the test, and say what it output.
+
+If a change makes the ordering test fail, that is the change being wrong — not the test needing adjustment. Do not relax the assertion.
+
+## Current phase
+
+v1: single process, no Manifold, no Elixir, no cross-machine distribution.
+
+The Go↔Erlang distribution bridge is proven to work (Ergo + `ergo.services/proto/erlang23` on OTP 29) but is a later phase. Don't design v1 in a way that forecloses it — in particular, don't bake process-local integer worker IDs into the `Store` API; ownership identity should be an opaque string.
+
+## Working notes
+
+- `DECISIONS.md` records product decisions and rejected alternatives. Append to it when a real decision gets made; don't rewrite history.
+- `FRICTION-LOG.md` records observations about porting Manifold's design. Add to it when something surprising happens, while it's fresh.
