@@ -1,0 +1,10 @@
+# Compiled binaries / build artifacts
+*.exe
+*.test
+*.out
+*.o
+*.a
+*.so
+/bin/
+/dist/
+spike/**/go-node
