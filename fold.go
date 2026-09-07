@@ -8,25 +8,33 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sharathb5/sharathfold/internal/hash"
 	"github.com/sharathb5/sharathfold/store"
 	"github.com/sharathb5/sharathfold/store/memory"
 )
 
-// Config configures a Dispatcher. This step uses a single worker and an
-// injected Transport; HTTP, partitions, and retries come later.
+// Config configures a Dispatcher.
 type Config struct {
-	Store     store.Store // nil → memory.New()
-	Transport Transport   // required until an HTTP default exists
+	Store      store.Store // nil → memory.New()
+	Transport  Transport   // required until an HTTP default exists
+	Workers    int         // default 1; production fan-out uses >1
+	Partitions int         // default 256; fixed, never worker count
+
+	// OverlapPartitions gives every worker every partition. Production leaves
+	// this false (exclusive ownership). The HOL ordering proof sets it true so
+	// a peer can attempt a later sequence for the same subscriber while one
+	// delivery is held open — exclusive ownership would make that race impossible.
+	OverlapPartitions bool
 }
 
-// Dispatcher accepts events and delivers them via a worker claiming from Store.
+// Dispatcher accepts events and delivers them via workers claiming from Store.
 type Dispatcher struct {
-	store     store.Store
-	transport Transport
-	mem       *memory.Store // non-nil when using memory (default or injected)
-
-	owner      string
+	store      store.Store
+	transport  Transport
+	mem        *memory.Store
+	own        ownership
 	generation uint64
+	workers    int
 
 	mu      sync.Mutex
 	started bool
@@ -43,6 +51,19 @@ func New(cfg Config) (*Dispatcher, error) {
 	if cfg.Transport == nil {
 		return nil, fmt.Errorf("fold: Transport is required")
 	}
+	workers := cfg.Workers
+	if workers <= 0 {
+		workers = 1
+	}
+	partitions := cfg.Partitions
+	if partitions <= 0 {
+		partitions = hash.DefaultPartitions
+	}
+	own, err := buildOwnership(workers, partitions, cfg.OverlapPartitions)
+	if err != nil {
+		return nil, err
+	}
+
 	st := cfg.Store
 	var mem *memory.Store
 	if st == nil {
@@ -55,12 +76,13 @@ func New(cfg Config) (*Dispatcher, error) {
 		store:      st,
 		transport:  cfg.Transport,
 		mem:        mem,
-		owner:      "worker-0",
+		own:        own,
 		generation: 1,
+		workers:    workers,
 	}, nil
 }
 
-// Start launches the single claim/deliver worker.
+// Start launches the worker pool.
 func (d *Dispatcher) Start(ctx context.Context) error {
 	_ = ctx
 	d.mu.Lock()
@@ -75,7 +97,21 @@ func (d *Dispatcher) Start(ctx context.Context) error {
 	d.workerCancel = cancel
 	d.workerDone = make(chan struct{})
 	d.started = true
-	go d.runWorker(wctx)
+
+	var wg sync.WaitGroup
+	for w := 0; w < d.workers; w++ {
+		owner := ownerID(w)
+		parts := append([]int(nil), d.own.partitionsFor(owner)...)
+		wg.Add(1)
+		go func(owner string, parts []int) {
+			defer wg.Done()
+			d.runWorker(wctx, owner, parts)
+		}(owner, parts)
+	}
+	go func() {
+		wg.Wait()
+		close(d.workerDone)
+	}()
 	return nil
 }
 
@@ -121,7 +157,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, ev Event, subs []Subscriber) 
 			EventID:      ev.ID,
 			SubscriberID: s.ID,
 			URL:          s.URL,
-			Partition:    0, // partitioning comes later; single worker owns all
+			Partition:    hash.Partition(s.ID, d.own.partitions),
 			Payload:      payload,
 			EventType:    ev.Type,
 		}
@@ -129,7 +165,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, ev Event, subs []Subscriber) 
 	return d.store.Enqueue(ctx, rows)
 }
 
-// Close stops accepting work, waits for the queue to drain, then stops the worker.
+// Close stops accepting work, waits for the queue to drain, then stops workers.
 func (d *Dispatcher) Close(ctx context.Context) error {
 	d.mu.Lock()
 	if d.closed {
@@ -195,8 +231,7 @@ func (d *Dispatcher) notifyCh() <-chan struct{} {
 	if d.mem != nil {
 		return d.mem.Notify()
 	}
-	ch := make(chan struct{})
-	return ch
+	return make(chan struct{})
 }
 
 func (d *Dispatcher) nextID() string {
