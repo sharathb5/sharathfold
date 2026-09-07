@@ -24,6 +24,11 @@ func (r *RecordingTransport) Deliver(ctx context.Context, d store.Delivery) erro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	r.record(d)
+	return nil
+}
+
+func (r *RecordingTransport) record(d store.Delivery) {
 	cp := d
 	if d.Payload != nil {
 		cp.Payload = append([]byte(nil), d.Payload...)
@@ -31,7 +36,6 @@ func (r *RecordingTransport) Deliver(ctx context.Context, d store.Delivery) erro
 	r.mu.Lock()
 	r.calls = append(r.calls, cp)
 	r.mu.Unlock()
-	return nil
 }
 
 // Calls returns a snapshot of recorded deliveries in attempt order.
@@ -41,4 +45,65 @@ func (r *RecordingTransport) Calls() []store.Delivery {
 	out := make([]store.Delivery, len(r.calls))
 	copy(out, r.calls)
 	return out
+}
+
+// HoldingTransport blocks the first Deliver for HoldSubscriber before
+// recording it, so a peer worker can claim and record a later sequence first.
+// That is the observable inversion HOL is meant to prevent.
+type HoldingTransport struct {
+	RecordingTransport
+
+	HoldSubscriber string
+
+	mu          sync.Mutex
+	holding     bool
+	held        chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+// NewHoldingTransport prepares a transport that holds the first attempt for sub.
+func NewHoldingTransport(sub string) *HoldingTransport {
+	return &HoldingTransport{
+		HoldSubscriber: sub,
+		held:           make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+}
+
+// Held returns a channel closed when the hold begins (before recording).
+func (h *HoldingTransport) Held() <-chan struct{} {
+	return h.held
+}
+
+// Release unblocks the held delivery.
+func (h *HoldingTransport) Release() {
+	h.releaseOnce.Do(func() { close(h.release) })
+}
+
+// Deliver may block before recording the first HoldSubscriber attempt.
+func (h *HoldingTransport) Deliver(ctx context.Context, d store.Delivery) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if d.SubscriberID == h.HoldSubscriber {
+		h.mu.Lock()
+		startHold := !h.holding
+		if startHold {
+			h.holding = true
+		}
+		h.mu.Unlock()
+		if startHold {
+			close(h.held)
+			select {
+			case <-h.release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	h.record(d)
+	return nil
 }

@@ -9,9 +9,7 @@ import (
 
 const claimBatch = 64
 
-func (d *Dispatcher) runWorker(ctx context.Context) {
-	defer close(d.workerDone)
-
+func (d *Dispatcher) runWorker(ctx context.Context, owner string, partitions []int) {
 	idle := time.NewTimer(time.Hour)
 	defer idle.Stop()
 
@@ -20,7 +18,7 @@ func (d *Dispatcher) runWorker(ctx context.Context) {
 			return
 		}
 
-		batch, err := d.store.Claim(ctx, d.owner, d.generation, nil, claimBatch)
+		batch, err := d.store.Claim(ctx, owner, d.generation, partitions, claimBatch)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -41,20 +39,18 @@ func (d *Dispatcher) runWorker(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			d.deliverOne(ctx, del)
+			d.deliverOne(ctx, owner, del)
 		}
 	}
 }
 
-func (d *Dispatcher) deliverOne(ctx context.Context, del store.Delivery) {
+func (d *Dispatcher) deliverOne(ctx context.Context, owner string, del store.Delivery) {
 	err := d.transport.Deliver(ctx, del)
 	if err != nil {
-		// Retries are a later step. Park the row so HOL is not jammed forever
-		// if a test injects transport errors.
-		_ = d.store.MarkFailed(ctx, del.ID, d.owner, d.generation, del.Attempt, time.Now().Add(time.Hour), err.Error())
+		_ = d.store.MarkFailed(ctx, del.ID, owner, d.generation, del.Attempt, time.Now().Add(time.Hour), err.Error())
 		return
 	}
-	_ = d.store.MarkDelivered(ctx, del.ID, d.owner, d.generation)
+	_ = d.store.MarkDelivered(ctx, del.ID, owner, d.generation)
 }
 
 func (d *Dispatcher) waitForWork(ctx context.Context, idle *time.Timer) bool {
