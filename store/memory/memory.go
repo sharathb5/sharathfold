@@ -16,6 +16,9 @@ type Store struct {
 	byID   map[string]*store.Delivery
 	seq    map[string]int64 // next sequence per subscriber
 	notify chan struct{}
+
+	// DisableHOL skips head-of-line gating. For invariant tests only.
+	DisableHOL bool
 }
 
 // New returns an empty memory store.
@@ -107,15 +110,22 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 
 	now := time.Now()
 	partSet := partitionSet(partitions)
+	if partSet == nil {
+		// Workers must pass the partitions they own. Empty means claim nothing
+		// (avoids accidental all-partition claims under a multi-worker pool).
+		return nil, nil
+	}
 
 	// Earliest unfinished sequence per subscriber (pending or in_flight).
 	head := make(map[string]int64)
-	for _, d := range s.byID {
-		if d.Status != store.StatusPending && d.Status != store.StatusInFlight {
-			continue
-		}
-		if cur, ok := head[d.SubscriberID]; !ok || d.Sequence < cur {
-			head[d.SubscriberID] = d.Sequence
+	if !s.DisableHOL {
+		for _, d := range s.byID {
+			if d.Status != store.StatusPending && d.Status != store.StatusInFlight {
+				continue
+			}
+			if cur, ok := head[d.SubscriberID]; !ok || d.Sequence < cur {
+				head[d.SubscriberID] = d.Sequence
+			}
 		}
 	}
 
@@ -127,12 +137,10 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 		if !d.NextAttempt.IsZero() && d.NextAttempt.After(now) {
 			continue
 		}
-		if partSet != nil {
-			if _, ok := partSet[d.Partition]; !ok {
-				continue
-			}
+		if _, ok := partSet[d.Partition]; !ok {
+			continue
 		}
-		if head[d.SubscriberID] != d.Sequence {
+		if !s.DisableHOL && head[d.SubscriberID] != d.Sequence {
 			continue
 		}
 		candidates = append(candidates, candidate{id: id, seq: d.Sequence, sub: d.SubscriberID})
@@ -151,11 +159,13 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 		if len(out) >= limit {
 			break
 		}
-		if _, taken := claimedSubs[c.sub]; taken {
-			continue
+		if !s.DisableHOL {
+			if _, taken := claimedSubs[c.sub]; taken {
+				continue
+			}
 		}
 		d := s.byID[c.id]
-		if head[d.SubscriberID] != d.Sequence {
+		if !s.DisableHOL && head[d.SubscriberID] != d.Sequence {
 			continue
 		}
 		d.Status = store.StatusInFlight
@@ -163,7 +173,9 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 		d.Generation = generation
 		d.ClaimedAt = now
 		d.Attempt++
-		claimedSubs[d.SubscriberID] = struct{}{}
+		if !s.DisableHOL {
+			claimedSubs[d.SubscriberID] = struct{}{}
+		}
 		out = append(out, cloneDelivery(d))
 	}
 	return out, nil
