@@ -47,6 +47,17 @@ What does transfer is partitioning the *sending workload* across workers with st
 
 ---
 
+### P5 — First ordering test stayed green with the guarantee disabled
+**What happened:** disabled the head-of-line gate in the in-memory Claim path and re-ran the concurrent ordering test. It still passed with zero inversions. Sorting candidates by `(subscriber, sequence)` inside Claim, plus a single worker delivering each batch synchronously through an always-succeeding transport, produced attempt order without the gate. The test looked like coverage and wasn't.
+
+**Expected:** removing the mechanism that enforces the invariant should make the invariant test fail.
+
+**Cost:** false confidence until step 2; would have compounded once generation stamps and partition claiming had the same failure mode — plausible code, silent breakage, green tests.
+
+**Lesson (not Manifold-specific):** an ordering test only proves the gate if it can fail without it — at least two workers and a transport that holds a delivery open long enough for a peer to claim a later sequence for the same subscriber. Assert zero inversions with HOL on, nonzero with it off.
+
+---
+
 ## Library notes
 
 *(Empty until the scale-out phase. Expected sources of friction, to be confirmed or dismissed:)*

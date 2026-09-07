@@ -45,7 +45,9 @@ Organized by responsibility, not by feature. Keep the root package small and hos
 
 ## Definition of done
 
-A change is not complete until the ordering test passes under concurrent load with zero per-subscriber inversions. Run it after any change to `worker.go`, `partition.go`, or either store implementation.
+The ordering test must run with at least two workers and a transport that can hold a delivery open long enough for a peer to claim a later sequence for the same subscriber. It must assert zero inversions with head-of-line enforcement on, and nonzero with it off. Run it after any change to `worker.go`, `partition.go`, or either store implementation.
+
+A test for an invariant must be shown to fail when the invariant is removed. Before trusting a new invariant test, disable the mechanism it guards, confirm the test fails, then restore it and confirm it passes. Report both outputs. A test that passes either way proves nothing and is worse than no test, because it looks like coverage.
 
 Do not report a task as finished based on the code looking correct. Run the test, and say what it output.
 
