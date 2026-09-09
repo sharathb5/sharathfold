@@ -82,6 +82,13 @@ What does transfer is partitioning the *sending workload* across workers with st
 
 **Dismissed from the pre-list:** The old `goerlang/node` concern — this path uses Ergo + `erlang23` (same stack as `dist-handshake`) and completed against OTP 29 without handshake patching.
 
+### L2 — Nested ETF maps from Elixir did not round-trip; JSON binary did
+**What happened:** First multi-node e2e under `manifold/` sent `{:dispatch, event_map, subscribers, from}` with nested Elixir maps. `give_pid` worked; the dispatch tuple never produced a reply. Direct `send/2` of the same shape also timed out — so it was not Manifold-specific. Switching the payload to a Jason JSON binary (`{:dispatch, json, from}`) delivered immediately and `fold.Dispatch` ran.
+
+**Expected:** ETF maps with string keys would decode into `etf.Map` on Ergo the way atoms and binaries already do.
+
+**Cost:** An hour chasing Manifold routing when the failure was on the wire format. Workaround is fine for the orchestrator boundary; a richer ETF map story is still open if we want native term payloads later.
+
 ### L3 — Cross-node HOL tooth needs overlapped claims, not production assignment
 **What happened:** `TestMultiNodeHOLEnforcement` with two Dispatchers on shared Postgres: disjoint `PartitionsClaim` (production Manifold assignment) produced **zero** peer inversions even with HOL off — exclusivity already prevents the race. Intentionally overlapping claims restored the tooth: HOL on → 0 inversions, HOL off → nonzero. Same lesson as P5, now at node boundary.
 

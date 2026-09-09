@@ -1,0 +1,4 @@
+%{
+  "jason": {:hex, :jason, "1.4.5", "2e3a008590b0b8d7388c20293e9dcc9cf3e5d642fd2a114e4cbbb52e595d940a", [:mix], [{:decimal, "~> 1.0 or ~> 2.0 or ~> 3.0", [hex: :decimal, repo: "hexpm", optional: true]}], "hexpm", "b0c823996102bcd0239b3c2444eb00409b72f6a140c1950bc8b457d836b30684"},
+  "manifold": {:hex, :manifold, "1.7.0", "b0395268e67d042716f4366289a580a0f63ecabf1516b4fa67e14aa3ba69baf3", [:mix], [], "hexpm", "5a6f58d1901fef954e55d70b9ed0a68bd6acfc345c231cffc83a210e942a9161"},
+}

@@ -31,6 +31,7 @@ bench/
   naive/             unordered baseline for comparison
   fifo/              strict single-threaded FIFO baseline
 spike/               throwaway experiments; never imported by library code
+manifold/            optional Manifold scale-out (Elixir orch + Go nodes); separate go.mod
 ```
 
 Organized by responsibility, not by feature. Keep the root package small and host-facing.
@@ -58,9 +59,9 @@ If a change makes the ordering test fail, that is the change being wrong — not
 
 ## Current phase
 
-v1: single process, no Manifold, no Elixir, no cross-machine distribution.
+v1 complete (single process). Phase two: optional Manifold scale-out under `manifold/` (DECISIONS D12). Elixir orchestrator routes with real Manifold; Go nodes run fold against shared Postgres with disjoint `PartitionsClaim`. v1 public Dispatch API unchanged.
 
-The Go↔Erlang distribution bridge is proven to work (Ergo + `ergo.services/proto/erlang23` on OTP 29) but is a later phase. Don't design v1 in a way that forecloses it — in particular, don't bake process-local integer worker IDs into the `Store` API; ownership identity should be an opaque string.
+The Go↔Erlang distribution bridge is proven (Ergo + `erlang23` on OTP 29). Ownership identity stays an opaque string; multi-node uses `IDPrefix` + `PartitionsClaim`.
 
 ## Working notes
 
