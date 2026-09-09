@@ -2,15 +2,50 @@ package fold
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/sharathb5/sharathfold/store"
 )
 
+// Outcome classifies a delivery attempt. The transport only reports what
+// happened; retry scheduling and suspension live in the worker.
+type Outcome int
+
+const (
+	OutcomeSuccess Outcome = iota
+	OutcomeRetryable
+	OutcomePermanent
+)
+
+// Result is the outcome of one Transport.Deliver call.
+type Result struct {
+	Outcome    Outcome
+	StatusCode int // 0 when no HTTP response was received
+	Err        error
+}
+
+// Error returns a short description suitable for store LastError, or "".
+func (r Result) Error() string {
+	if r.Outcome == OutcomeSuccess {
+		return ""
+	}
+	if r.Err != nil {
+		if r.StatusCode > 0 {
+			return fmt.Sprintf("status %d: %v", r.StatusCode, r.Err)
+		}
+		return r.Err.Error()
+	}
+	if r.StatusCode > 0 {
+		return fmt.Sprintf("status %d", r.StatusCode)
+	}
+	return "delivery failed"
+}
+
 // Transport delivers one claimed delivery. Implementations must not mutate
 // d.Payload; the bytes are shared read-only across subscribers of an event.
 type Transport interface {
-	Deliver(ctx context.Context, d store.Delivery) error
+	Deliver(ctx context.Context, d store.Delivery) Result
 }
 
 // RecordingTransport is a fake Transport that appends each call in order.
@@ -20,12 +55,12 @@ type RecordingTransport struct {
 }
 
 // Deliver records a copy of the delivery.
-func (r *RecordingTransport) Deliver(ctx context.Context, d store.Delivery) error {
+func (r *RecordingTransport) Deliver(ctx context.Context, d store.Delivery) Result {
 	if err := ctx.Err(); err != nil {
-		return err
+		return Result{Outcome: OutcomeRetryable, Err: err}
 	}
 	r.record(d)
-	return nil
+	return Result{Outcome: OutcomeSuccess}
 }
 
 func (r *RecordingTransport) record(d store.Delivery) {
@@ -82,9 +117,9 @@ func (h *HoldingTransport) Release() {
 }
 
 // Deliver may block before recording the first HoldSubscriber attempt.
-func (h *HoldingTransport) Deliver(ctx context.Context, d store.Delivery) error {
+func (h *HoldingTransport) Deliver(ctx context.Context, d store.Delivery) Result {
 	if err := ctx.Err(); err != nil {
-		return err
+		return Result{Outcome: OutcomeRetryable, Err: err}
 	}
 
 	if d.SubscriberID == h.HoldSubscriber {
@@ -99,11 +134,11 @@ func (h *HoldingTransport) Deliver(ctx context.Context, d store.Delivery) error 
 			select {
 			case <-h.release:
 			case <-ctx.Done():
-				return ctx.Err()
+				return Result{Outcome: OutcomeRetryable, Err: ctx.Err()}
 			}
 		}
 	}
 
 	h.record(d)
-	return nil
+	return Result{Outcome: OutcomeSuccess}
 }

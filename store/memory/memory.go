@@ -10,15 +10,45 @@ import (
 	"github.com/sharathb5/sharathfold/store"
 )
 
+const (
+	// DefaultRetentionMaxCount caps retained deliveries per suspended subscriber.
+	DefaultRetentionMaxCount = 1000
+	// DefaultRetentionMaxAge drops retained deliveries older than this.
+	DefaultRetentionMaxAge = 24 * time.Hour
+)
+
+type subMeta struct {
+	suspended bool
+	gap       bool
+	dropped   int
+	marker    string
+}
+
 // Store is an in-memory map-and-mutex Store.
 type Store struct {
 	mu     sync.Mutex
 	byID   map[string]*store.Delivery
 	seq    map[string]int64 // next sequence per subscriber
+	subs   map[string]*subMeta
 	notify chan struct{}
+
+	// RetentionMaxCount / RetentionMaxAge bound retained backlog per
+	// suspended subscriber. Zero selects the defaults above.
+	RetentionMaxCount int
+	RetentionMaxAge   time.Duration
 
 	// DisableHOL skips head-of-line gating. For invariant tests only.
 	DisableHOL bool
+
+	// SkipSuspendGate makes Claim ignore suspension and Enqueue always insert
+	// pending rows. For invariant tests only — proves "nothing while suspended."
+	SkipSuspendGate bool
+
+	// ClaimCalls / ClaimRows / ClaimNonEmpty accumulate Claim traffic for
+	// benchmarks. Safe to read after workers have stopped.
+	ClaimCalls    int64
+	ClaimRows     int64
+	ClaimNonEmpty int64
 }
 
 // New returns an empty memory store.
@@ -26,6 +56,7 @@ func New() *Store {
 	return &Store{
 		byID:   make(map[string]*store.Delivery),
 		seq:    make(map[string]int64),
+		subs:   make(map[string]*subMeta),
 		notify: make(chan struct{}, 1),
 	}
 }
@@ -43,6 +74,29 @@ func (s *Store) signal() {
 	}
 }
 
+func (s *Store) meta(subscriberID string) *subMeta {
+	m, ok := s.subs[subscriberID]
+	if !ok {
+		m = &subMeta{}
+		s.subs[subscriberID] = m
+	}
+	return m
+}
+
+func (s *Store) retentionCount() int {
+	if s.RetentionMaxCount > 0 {
+		return s.RetentionMaxCount
+	}
+	return DefaultRetentionMaxCount
+}
+
+func (s *Store) retentionAge() time.Duration {
+	if s.RetentionMaxAge > 0 {
+		return s.RetentionMaxAge
+	}
+	return DefaultRetentionMaxAge
+}
+
 // Enqueue implements store.Store.
 func (s *Store) Enqueue(ctx context.Context, ds []store.Delivery) error {
 	if err := ctx.Err(); err != nil {
@@ -52,6 +106,7 @@ func (s *Store) Enqueue(ctx context.Context, ds []store.Delivery) error {
 	defer s.mu.Unlock()
 
 	now := time.Now()
+	touched := map[string]struct{}{}
 	for i := range ds {
 		d := ds[i]
 		if d.ID == "" {
@@ -71,8 +126,10 @@ func (s *Store) Enqueue(ctx context.Context, ds []store.Delivery) error {
 		if d.Payload != nil {
 			cp.Payload = append([]byte(nil), d.Payload...)
 		}
+		if d.Secret != nil {
+			cp.Secret = append([]byte(nil), d.Secret...)
+		}
 		cp.Sequence = seq
-		cp.Status = store.StatusPending
 		cp.Attempt = 0
 		cp.NextAttempt = now
 		cp.CreatedAt = now
@@ -81,7 +138,17 @@ func (s *Store) Enqueue(ctx context.Context, ds []store.Delivery) error {
 		cp.ClaimedAt = time.Time{}
 		cp.LastError = ""
 
+		if !s.SkipSuspendGate && s.meta(d.SubscriberID).suspended {
+			cp.Status = store.StatusRetained
+			touched[d.SubscriberID] = struct{}{}
+		} else {
+			cp.Status = store.StatusPending
+		}
+
 		s.byID[cp.ID] = &cp
+	}
+	for sub := range touched {
+		s.applyRetentionLocked(sub, now)
 	}
 	s.signal()
 	return nil
@@ -101,6 +168,9 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 	if owner == "" {
 		return nil, fmt.Errorf("memory store: claim requires owner")
 	}
+	if generation == 0 {
+		return nil, fmt.Errorf("memory store: claim requires non-zero generation")
+	}
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -109,6 +179,7 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 	defer s.mu.Unlock()
 
 	now := time.Now()
+	s.ClaimCalls++
 	partSet := partitionSet(partitions)
 	if partSet == nil {
 		// Workers must pass the partitions they own. Empty means claim nothing
@@ -132,6 +203,9 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 	var candidates []candidate
 	for id, d := range s.byID {
 		if d.Status != store.StatusPending {
+			continue
+		}
+		if !s.SkipSuspendGate && s.meta(d.SubscriberID).suspended {
 			continue
 		}
 		if !d.NextAttempt.IsZero() && d.NextAttempt.After(now) {
@@ -178,7 +252,18 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 		}
 		out = append(out, cloneDelivery(d))
 	}
+	s.ClaimRows += int64(len(out))
+	if len(out) > 0 {
+		s.ClaimNonEmpty++
+	}
 	return out, nil
+}
+
+// ClaimStats returns cumulative Claim counters (calls, rows, nonempty calls).
+func (s *Store) ClaimStats() (calls, rows, nonempty int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ClaimCalls, s.ClaimRows, s.ClaimNonEmpty
 }
 
 // MarkDelivered implements store.Store.
@@ -214,6 +299,108 @@ func (s *Store) MarkFailed(ctx context.Context, id string, owner string, generat
 	return nil
 }
 
+// ExhaustAndSuspend implements store.Store.
+func (s *Store) ExhaustAndSuspend(ctx context.Context, id string, owner string, generation uint64, errMsg string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	d, err := s.requireOwner(id, owner, generation)
+	if err != nil {
+		return err
+	}
+	subID := d.SubscriberID
+	d.Status = store.StatusDeadLettered
+	d.LastError = errMsg
+	d.Owner = ""
+	d.Generation = 0
+	d.ClaimedAt = time.Time{}
+
+	m := s.meta(subID)
+	m.suspended = true
+
+	now := time.Now()
+	for _, row := range s.byID {
+		if row.SubscriberID != subID {
+			continue
+		}
+		if row.Status == store.StatusPending {
+			row.Status = store.StatusRetained
+			row.Owner = ""
+			row.Generation = 0
+			row.ClaimedAt = time.Time{}
+		}
+	}
+	s.applyRetentionLocked(subID, now)
+	s.signal()
+	return nil
+}
+
+// Resume implements store.Store.
+func (s *Store) Resume(ctx context.Context, subscriberID string) (store.GapInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return store.GapInfo{}, err
+	}
+	if subscriberID == "" {
+		return store.GapInfo{}, fmt.Errorf("memory store: resume requires subscriberID")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	s.applyRetentionLocked(subscriberID, now)
+
+	m := s.meta(subscriberID)
+	gap := store.GapInfo{
+		Occurred: m.gap,
+		Dropped:  m.dropped,
+		Marker:   m.marker,
+	}
+
+	var retained []*store.Delivery
+	for _, d := range s.byID {
+		if d.SubscriberID == subscriberID && d.Status == store.StatusRetained {
+			retained = append(retained, d)
+		}
+	}
+	sort.Slice(retained, func(i, j int) bool {
+		return retained[i].Sequence < retained[j].Sequence
+	})
+
+	for _, d := range retained {
+		d.Status = store.StatusPending
+		d.NextAttempt = now
+		d.Owner = ""
+		d.Generation = 0
+		d.ClaimedAt = time.Time{}
+	}
+
+	m.suspended = false
+	m.gap = false
+	m.dropped = 0
+	m.marker = ""
+
+	s.signal()
+	return gap, nil
+}
+
+// IsSuspended implements store.Store.
+func (s *Store) IsSuspended(ctx context.Context, subscriberID string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.subs[subscriberID]
+	if !ok {
+		return false, nil
+	}
+	return m.suspended, nil
+}
+
 // RecoverStale implements store.Store.
 func (s *Store) RecoverStale(ctx context.Context, olderThan time.Duration) (int, error) {
 	if err := ctx.Err(); err != nil {
@@ -243,7 +430,7 @@ func (s *Store) RecoverStale(ctx context.Context, olderThan time.Duration) (int,
 	return n, nil
 }
 
-// PendingOrInFlight reports how many non-terminal deliveries remain.
+// PendingOrInFlight reports how many non-terminal, non-retained deliveries remain.
 func (s *Store) PendingOrInFlight() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -254,6 +441,53 @@ func (s *Store) PendingOrInFlight() int {
 		}
 	}
 	return n
+}
+
+// RetainedCount reports how many deliveries are held for suspended subscribers.
+func (s *Store) RetainedCount(subscriberID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, d := range s.byID {
+		if d.SubscriberID == subscriberID && d.Status == store.StatusRetained {
+			n++
+		}
+	}
+	return n
+}
+
+func (s *Store) applyRetentionLocked(subscriberID string, now time.Time) {
+	maxCount := s.retentionCount()
+	maxAge := s.retentionAge()
+	cutoff := now.Add(-maxAge)
+
+	var retained []*store.Delivery
+	for _, d := range s.byID {
+		if d.SubscriberID != subscriberID || d.Status != store.StatusRetained {
+			continue
+		}
+		if !d.CreatedAt.IsZero() && d.CreatedAt.Before(cutoff) {
+			s.dropRetainedLocked(d, "age")
+			continue
+		}
+		retained = append(retained, d)
+	}
+
+	sort.Slice(retained, func(i, j int) bool {
+		return retained[i].Sequence < retained[j].Sequence
+	})
+	for len(retained) > maxCount {
+		s.dropRetainedLocked(retained[0], "count")
+		retained = retained[1:]
+	}
+}
+
+func (s *Store) dropRetainedLocked(d *store.Delivery, reason string) {
+	m := s.meta(d.SubscriberID)
+	m.gap = true
+	m.dropped++
+	m.marker = fmt.Sprintf("%s:dropped=%d:through_seq=%d:%s", d.SubscriberID, m.dropped, d.Sequence, reason)
+	delete(s.byID, d.ID)
 }
 
 func (s *Store) markTerminal(ctx context.Context, id, owner string, generation uint64, status store.Status, errMsg string) error {
@@ -277,6 +511,9 @@ func (s *Store) markTerminal(ctx context.Context, id, owner string, generation u
 }
 
 func (s *Store) requireOwner(id, owner string, generation uint64) (*store.Delivery, error) {
+	if generation == 0 {
+		return nil, fmt.Errorf("memory store: mark requires non-zero generation")
+	}
 	d, ok := s.byID[id]
 	if !ok {
 		return nil, fmt.Errorf("memory store: unknown delivery %s", id)
@@ -306,5 +543,23 @@ func cloneDelivery(d *store.Delivery) store.Delivery {
 	if d.Payload != nil {
 		cp.Payload = append([]byte(nil), d.Payload...)
 	}
+	if d.Secret != nil {
+		cp.Secret = append([]byte(nil), d.Secret...)
+	}
 	return cp
+}
+
+// BackdateClaimForTest sets claimed_at on an in_flight row. For crash-recovery tests.
+func (s *Store) BackdateClaimForTest(id string, claimedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.byID[id]
+	if !ok {
+		return fmt.Errorf("memory store: unknown delivery %s", id)
+	}
+	if d.Status != store.StatusInFlight {
+		return fmt.Errorf("memory store: %s is not in_flight", id)
+	}
+	d.ClaimedAt = claimedAt
+	return nil
 }
