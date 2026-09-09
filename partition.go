@@ -12,31 +12,54 @@ type ownership struct {
 	byOwner    map[string][]int
 	byPart     []string // partition -> owner (exclusive); empty string if overlap
 	overlap    bool
+	// narrowed is true when this process claims a subset of the hash space
+	// (PartitionsClaim). Resize is unsupported while narrowed.
+	narrowed bool
 }
 
-func buildOwnership(workers, partitions int, overlap bool) (ownership, error) {
+func buildOwnership(workers, partitions int, overlap bool, claim []int) (ownership, error) {
 	if workers <= 0 {
 		return ownership{}, fmt.Errorf("fold: Workers must be >= 1")
 	}
 	if partitions <= 0 {
 		partitions = hash.DefaultPartitions
 	}
+
+	narrowed := claim != nil
+	universe := claim
+	if universe == nil {
+		universe = make([]int, partitions)
+		for p := 0; p < partitions; p++ {
+			universe[p] = p
+		}
+	} else {
+		seen := make(map[int]struct{}, len(universe))
+		for _, p := range universe {
+			if p < 0 || p >= partitions {
+				return ownership{}, fmt.Errorf("fold: PartitionsClaim value %d out of [0, %d)", p, partitions)
+			}
+			if _, ok := seen[p]; ok {
+				return ownership{}, fmt.Errorf("fold: PartitionsClaim duplicate partition %d", p)
+			}
+			seen[p] = struct{}{}
+		}
+	}
+
 	o := ownership{
 		partitions: partitions,
 		byOwner:    make(map[string][]int, workers),
 		byPart:     make([]string, partitions),
 		overlap:    overlap,
+		narrowed:   narrowed,
 	}
 	for w := 0; w < workers; w++ {
 		id := ownerID(w)
-		parts := make([]int, 0, (partitions/workers)+1)
+		parts := make([]int, 0, (len(universe)/workers)+1)
 		if overlap {
-			for p := 0; p < partitions; p++ {
-				parts = append(parts, p)
-			}
+			parts = append(parts, universe...)
 		} else {
-			for p := 0; p < partitions; p++ {
-				if p%workers == w {
+			for i, p := range universe {
+				if i%workers == w {
 					parts = append(parts, p)
 					o.byPart[p] = id
 				}
