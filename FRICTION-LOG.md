@@ -82,6 +82,11 @@ What does transfer is partitioning the *sending workload* across workers with st
 
 **Dismissed from the pre-list:** The old `goerlang/node` concern — this path uses Ergo + `erlang23` (same stack as `dist-handshake`) and completed against OTP 29 without handshake patching.
 
+### L3 — Cross-node HOL tooth needs overlapped claims, not production assignment
+**What happened:** `TestMultiNodeHOLEnforcement` with two Dispatchers on shared Postgres: disjoint `PartitionsClaim` (production Manifold assignment) produced **zero** peer inversions even with HOL off — exclusivity already prevents the race. Intentionally overlapping claims restored the tooth: HOL on → 0 inversions, HOL off → nonzero. Same lesson as P5, now at node boundary.
+
+**Expected:** "Does the ordering test still fail with HOL disabled across nodes?" — only when claim scopes overlap. Under D12's disjoint assignment the peer race is impossible by construction; HOL's remaining jobs are same-owner retry skip-ahead and any future handoff.
+
 Do not pre-write further entries. Fill them in as they actually happen.
 
 ---

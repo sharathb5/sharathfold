@@ -159,11 +159,26 @@ Three patterns companies use today:
 
 ---
 
+### D12 — Manifold routes; the library still gates
+**Decided:** on the optional multi-node path, real Manifold (Elixir) chooses which Go node owns which subscriber. That assignment replaces `internal/hash` as the *cross-node* home mechanism. Once a delivery is enqueued on a node, that node's fold store enforces head-of-line ordering exactly as in v1. Ordering holds because assignment is stable and each node serializes its own subscribers locally. Manifold answers **where**; the library answers **when** and what happens on failure.
+
+**Division of labor:** Discord's Manifold recipients are sessions they own that do not fail for hours, so Manifold never needed delivery semantics — retries, suspension, HOL against skip-ahead. That gap is what fold fills. The bridge does not move those semantics into Elixir.
+
+**Rejected alternatives:**
+- **Elixir tracks in-flight delivery and withholds sequence N+1 until Go acks N.** Duplicates delivery state across two runtimes, requires an acknowledgment path back over the wire, and forces the orchestrator to handle a Go node dying with work outstanding — all to reproduce a guarantee the store already provides.
+- **Per-subscriber process on the Go side; Manifold routes directly to it; ordering from single-message-at-a-time processing.** Closest to how Discord uses Manifold, but it means many long-lived processes and bets heavily on Ergo's process model under load, which is untested. Fold's store remains the ordering mechanism.
+
+**Consequence for ownership:** nodes that share Postgres must claim disjoint partition sets (matched to Manifold's subscriber→node assignment). Exclusive claim scope across processes is what keeps two nodes from becoming two claimants for the same subscriber. The HOL gate continues to cover same-owner retry skip-ahead and any intentional overlap used in tests.
+
+**Packaging:** lives under `manifold/` with its own module boundary. v1's public Dispatch API stays unchanged; single-process fold does not require Elixir.
+
+---
+
 ## Open questions
 
-- **Durability.** A queue means events survive a crash; an in-process library holding events in memory doesn't. Needs an answer — possibly "persist to whatever database you already run," which is Postel's approach.
-- **Rebalancing.** When a worker or node joins or leaves, some subscribers get reassigned. Consistent hashing bounds how many, but any reassignment is a window where ordering can break. This is the most interesting design question in the project.
-- **Erlang handshake risk.** The Go-side distribution-protocol library found (goerlang/node) is old and admits missing pieces. May need patching to talk to a modern OTP release. This is the highest-uncertainty part of the scale-out path.
+- **Durability.** A queue means events survive a crash; an in-process library holding events in memory doesn't. Needs an answer — possibly "persist to whatever database you already run," which is Postel's approach. *(Postgres store exists; memory remains the zero-infra default.)*
+- **Rebalancing.** When a worker or node joins or leaves, some subscribers get reassigned. Consistent hashing bounds how many, but any reassignment is a window where ordering can break. This is the most interesting design question in the project. Multi-node today uses static `PartitionsClaim`; live rebalance across Go nodes is still open.
+- **Erlang handshake risk.** ~~The Go-side distribution-protocol library found (goerlang/node) is old…~~ Resolved via Ergo + `erlang23` on OTP 29 (spikes + `manifold/` e2e). Nested ETF maps remain awkward (FRICTION-LOG L2); JSON binary at the orchestrator boundary is the working path.
 
 ---
 

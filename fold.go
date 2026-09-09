@@ -59,11 +59,24 @@ type Config struct {
 	// client with connection reuse. Ignored when Transport is set.
 	HTTPClient *http.Client
 
+	// IDPrefix, when set, is prepended to generated delivery IDs. Multi-node
+	// setups that share a store must use distinct prefixes so Enqueue does not
+	// collide on primary key. Empty preserves v1 IDs (dlg_<n>).
+	IDPrefix string
+
 	// OverlapPartitions gives every worker every partition. Production leaves
 	// this false (exclusive ownership). The HOL ordering proof sets it true so
 	// a peer can attempt a later sequence for the same subscriber while one
 	// delivery is held open — exclusive ownership would make that race impossible.
 	OverlapPartitions bool
+
+	// PartitionsClaim, when non-nil, is the subset of [0, Partitions) this
+	// process's workers claim from the store. The subscriber hash space remains
+	// Partitions; only Claim is narrowed. Multi-node Manifold setups give each
+	// Go node a disjoint subset so two processes sharing Postgres are not two
+	// claimants for the same subscriber (DECISIONS D12). nil → claim the full
+	// space (v1 behavior).
+	PartitionsClaim []int
 
 	// StaleClaimAge controls Start's RecoverStale call. in_flight rows with
 	// claimed_at older than this are reset to pending. Zero selects
@@ -110,7 +123,8 @@ type Dispatcher struct {
 	workerWG     sync.WaitGroup
 	workerDone   chan struct{}
 
-	idSeq atomic.Uint64
+	idSeq    atomic.Uint64
+	idPrefix string
 
 	// Per-owner delivery/idle counters for load-balance diagnostics.
 	workerStats sync.Map // owner string -> *workerCounters
@@ -130,7 +144,7 @@ func New(cfg Config) (*Dispatcher, error) {
 	if partitions <= 0 {
 		partitions = hash.DefaultPartitions
 	}
-	own, err := buildOwnership(workers, partitions, cfg.OverlapPartitions)
+	own, err := buildOwnership(workers, partitions, cfg.OverlapPartitions, cfg.PartitionsClaim)
 	if err != nil {
 		return nil, err
 	}
@@ -177,6 +191,7 @@ func New(cfg Config) (*Dispatcher, error) {
 		maxBackoff:    maxBackoff,
 		onSuspend:     cfg.OnSuspend,
 		staleClaimAge: cfg.StaleClaimAge,
+		idPrefix:      cfg.IDPrefix,
 	}, nil
 }
 
@@ -250,11 +265,14 @@ func (d *Dispatcher) Resize(ctx context.Context, workers int) error {
 	if d.own.overlap {
 		return fmt.Errorf("fold: Resize requires exclusive partition ownership")
 	}
+	if d.own.narrowed {
+		return fmt.Errorf("fold: Resize with PartitionsClaim is not supported")
+	}
 	if workers == d.workers {
 		return nil
 	}
 
-	newOwn, err := buildOwnership(workers, d.own.partitions, false)
+	newOwn, err := buildOwnership(workers, d.own.partitions, false, nil)
 	if err != nil {
 		return err
 	}
@@ -430,6 +448,9 @@ func (d *Dispatcher) notifyCh() <-chan struct{} {
 
 func (d *Dispatcher) nextID() string {
 	n := d.idSeq.Add(1)
+	if d.idPrefix != "" {
+		return fmt.Sprintf("%sdlg_%d", d.idPrefix, n)
+	}
 	return fmt.Sprintf("dlg_%d", n)
 }
 
