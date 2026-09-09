@@ -1,0 +1,11 @@
+# Git hooks for fold. Install once after clone: `lefthook install`
+#
+# Picked lefthook over a plain .git/hooks/pre-commit so the hook config is
+# version-controlled and shared. The full invariant script is ~250ms locally,
+# so pre-commit runs all of it (nothing deferred to CI for speed).
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: invariants
+      run: ./scripts/check-invariants.sh

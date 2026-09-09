@@ -1,0 +1,23 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - bodyclose
+    - govet
+    - staticcheck
+  exclusions:
+    paths:
+      - spike/
+      - third_party$
+      - builtin$
+      - examples$
+      - scripts/checkserialize/
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
