@@ -29,6 +29,7 @@ internal/
   hash/
 bench/
   naive/             unordered baseline for comparison
+  fifo/              strict single-threaded FIFO baseline
 spike/               throwaway experiments; never imported by library code
 ```
 
@@ -38,14 +39,16 @@ Organized by responsibility, not by feature. Keep the root package small and hos
 
 1. **Never serialize in the worker path.** The payload is encoded once in `Dispatch` and the bytes are read-only afterward. No `json.Marshal` in `worker.go` or `deliver.go`.
 2. **Never make HTTP calls on the `Dispatch` path.** The caller returns as soon as rows are written to the store. Delivery is the workers' job.
-3. **Never claim outside owned partitions, and never bypass the head-of-line gate.** A worker may only claim rows in partitions it owns, and only when no earlier-sequence delivery for that subscriber is still pending or in-flight. This is the ordering guarantee — a shortcut here silently breaks the entire premise of the project.
+3. **Never claim outside owned partitions, and never bypass the head-of-line gate.** Exclusive partition ownership is the ordering guarantee across workers: one subscriber → one partition → one owner. The HOL gate is also load-bearing in ordinary operation — it covers two cases (see DECISIONS D7): (1) same-owner skip-ahead during retry backoff, when sequence N is pending on backoff and N+1 becomes due; (2) resize handoff, when the old owner may still have in-flight work while the new owner begins claiming. It is not resize-only and must not be treated as skippable outside a resize window. Skipping ownership or the gate silently breaks the premise.
 4. **Never mark a delivery terminal without checking the generation stamp.** A worker drained during a resize must not complete work under a stale ownership map.
 5. **`store/postgres` and `store/memory` must not import the root package.** Storage backends stay optional so core stays light.
 6. **Commit incrementally as work lands.** Prefer many small, coherent commits over one huge commit at the end of a session. Each commit should be one feature, fix, or logical step — scoped and atomic — so history reads as a sequence of meaningful changes. Commit when a unit of work is done and makes sense on its own (e.g. store interface before the memory impl, memory before workers, workers before retries), not when the whole task is finished. No drive-by refactors bundled with functional changes.
 
+Rules 1, 2, 4, and 5 are enforced by CI (`scripts/check-invariants.sh` + tests), not by review. A green build means they held; do not weaken the checks to make a change pass.
+
 ## Definition of done
 
-The ordering test must run with at least two workers and a transport that can hold a delivery open long enough for a peer to claim a later sequence for the same subscriber. It must assert zero inversions with head-of-line enforcement on, and nonzero with it off. Run it after any change to `worker.go`, `partition.go`, or either store implementation.
+The ordering test must run with at least two workers and a transport that can hold a delivery open long enough for a peer to claim a later sequence for the same subscriber. It must assert zero inversions with head-of-line enforcement on, and nonzero with it off. Run it after any change to `worker.go`, `partition.go`, or either store implementation. That test uses `OverlapPartitions` (not a production path). The gate's production jobs are same-owner retry skip-ahead and resize handoff (DECISIONS D7); the resize test covers handoff, and disabling HOL under exclusive ownership with failure injection covers retry skip-ahead.
 
 A test for an invariant must be shown to fail when the invariant is removed. Before trusting a new invariant test, disable the mechanism it guards, confirm the test fails, then restore it and confirm it passes. Report both outputs. A test that passes either way proves nothing and is worse than no test, because it looks like coverage.
 

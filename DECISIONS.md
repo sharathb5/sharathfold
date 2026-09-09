@@ -92,10 +92,76 @@ Three patterns companies use today:
 
 ---
 
+### D7 — Ordering comes from exclusive partition ownership, not the HOL gate
+**Decided:** per-subscriber ordering is a consequence of exclusive partition ownership. Each subscriber hashes to one partition; each partition has one owner; that owner is the only claimant for that subscriber's deliveries. Serialization across *workers* is by construction.
+
+**What the HOL gate actually does:** two load-bearing jobs, not one.
+
+1. **Same-owner skip-ahead during retry backoff (ordinary operation).** Exclusive ownership stops a *peer* from claiming a later sequence, but it does not stop the owning worker from claiming sequence N+1 while N is pending on backoff after a failed attempt. Without the gate, that worker delivers ahead and inversions appear with no resize involved. The uniform-latency attribution run (`fold-no-HOL` under exclusive ownership) produced 85 inversions this way. So the gate is live whenever retries occur — not dead code in steady state.
+
+2. **Resize handoff.** When a partition changes hands, the old owner may still have work in flight while the new owner begins claiming. HOL prevents the new owner from racing ahead of that in-flight earlier sequence.
+
+**Corrected earlier claim:** an earlier revision of this entry said the gate "never fires" under exclusive ownership with no resize, and that its real purpose was only the resize window. That was wrong. Peer races under exclusive ownership are indeed impossible (proving a *peer* race still needs `OverlapPartitions`), but same-owner skip-ahead during retry is a production path the gate must cover.
+
+**Consequence for tests:** both cases need proof. The resize test covers handoff. Same-owner retry skip-ahead is covered by disabling HOL under exclusive ownership with failure injection (see bench attribution). The synthetic `OverlapPartitions` ordering test remains useful for the peer-race shape but is not the product's only HOL production path.
+
+---
+
+### D8 — Failure handling is suspend-and-resume
+**Decided:** a subscriber is either healthy (receiving in order) or suspended (receiving nothing). Never receiving out of order. When deliveries to a subscriber exhaust their retries, that subscriber is suspended: queueing stops, backlog is dead-lettered, and they resume explicitly once their endpoint recovers. A subscriber's partition never changes; only their status does.
+
+**Rejected alternatives:**
+- Dead-letter the failed delivery and continue with the next one — trades the ordering guarantee (the product) for liveness.
+- Reassign a recovered subscriber to a different worker pool — breaks hash-determined ownership and reintroduces the two-claimant window the design exists to prevent.
+
+**Open (record, do not resolve here):**
+- How a subscriber learns they have been suspended.
+- Whether resume replays stored backlog or hands them a cursor.
+
+*(Resolved in D9 and D10.)*
+
+---
+
+### D9 — Recovery is pull-based, not push-based
+**Decided:** when a subscriber is suspended, fold sends them nothing — including no notification that they have been suspended. The host app exposes suspension state; the subscriber calls a resume endpoint when their endpoint has recovered. The recovery signal comes from the subscriber. Resolves D8's suspension-notification open question.
+
+**Rejected alternatives:**
+- Push a suspension notification to the webhook URL — circular: the notification fails for the same reason the webhook did, and it forces a second delivery path with its own retry semantics.
+- Active probing / health checks from fold — the library would be guessing recovery; the subscriber is the only party who reliably knows.
+
+**Why:** circuit-breaker logic. Stop calling a failing dependency and let it prove itself healthy rather than probing it. Fold's job is to stop delivery and retain (bounded) backlog; the host's job is to surface that state and accept the resume call.
+
+---
+
+### D10 — Catch-up is a bounded backlog, not an event API
+**Decided:** events for a suspended subscriber are retained up to a configurable bound (count and age). Resume clears suspension and replays what is still retained, in sequence order. If the subscriber was down longer than the window, resume reports that a gap occurred and returns a marker so the host app can reconcile as it sees fit. Resolves D8's resume-semantics open question.
+
+**Rejected alternatives:**
+- Require the host app to expose an event-history API that subscribers fetch from — a library cannot assume that shape exists, and requiring it would hurt adoption.
+- Unbounded retention — grows without limit for subscribers who never return.
+
+**Why:** fold can guarantee ordered replay of what it still holds. It cannot invent the host's historical event API. The bound makes the failure mode explicit (gap + marker) instead of silent memory growth.
+
+**Note on the suspend-resume boundary (D9/D10):** the boundary is currently safe by construction, not by test. Suspension is only triggered by `ExhaustAndSuspend` after `Deliver` returns, which dead-letters the in-flight row and flips the suspended flag under one lock, so no delivery can still be running when replay begins. The suspend-resume test asserts zero inversions on the quiet path only and would not catch a violation of this. Any future change that introduces a host-initiated Suspend while a delivery is in flight, or a drain path where an old owner completes work after a new owner starts claiming, reopens this window and must either preserve the post-delivery-under-lock ordering or add a test that synthesizes the overlap.
+
+---
+
+### D11 — Crash recovery uses claim age, not owner liveness
+**Decided:** on `Start`, `RecoverStale` resets `in_flight` rows whose `claimed_at` is older than `StaleClaimAge` (default `2 × DeliveryTimeout`) back to `pending`, clearing owner and generation. Sequence is unchanged, so HOL re-applies and deliveries keep accept order after recovery.
+
+**How abandoned is distinguished from live:** age of `claimed_at`, not process heartbeats. A live worker’s claim is fresher than the delivery timeout; an abandoned claim from a dead process sits past that window.
+
+**Why safe with shared Postgres:** a live worker still inside `Deliver` has `claimed_at` within the timeout window, so another process’s `RecoverStale` will not reset that row and will not create a second claimant. After the age threshold, either the live attempt has finished (`Mark*` with matching generation) or the owning process is gone — resetting is then the same as reclaiming stranded work. Stealing a still-live attempt would require the HTTP call (or the worker) to outlive `StaleClaimAge`; that is why the default exceeds `DeliveryTimeout`.
+
+**Rejected alternatives:**
+- Reset every `in_flight` on Start — breaks exclusivity when multiple processes share a store.
+- Heartbeat / lease table — correct for multi-node ownership, heavier than v1 needs; age-gated visibility timeout matches queue practice and reuses the existing `claimed_at` column.
+
+---
+
 ## Open questions
 
 - **Durability.** A queue means events survive a crash; an in-process library holding events in memory doesn't. Needs an answer — possibly "persist to whatever database you already run," which is Postel's approach.
-- **Retries and backoff.** Non-negotiable for production use. Customer endpoints go down constantly.
 - **Rebalancing.** When a worker or node joins or leaves, some subscribers get reassigned. Consistent hashing bounds how many, but any reassignment is a window where ordering can break. This is the most interesting design question in the project.
 - **Erlang handshake risk.** The Go-side distribution-protocol library found (goerlang/node) is old and admits missing pieces. May need patching to talk to a modern OTP release. This is the highest-uncertainty part of the scale-out path.
 

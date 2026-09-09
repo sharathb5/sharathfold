@@ -58,6 +58,17 @@ What does transfer is partitioning the *sending workload* across workers with st
 
 ---
 
+### P6 — Manifold never faces subscriber endpoint failure the way webhooks do
+**What happened:** deciding what to do when a subscriber's endpoint stays down forced a product choice (suspend-and-resume; see DECISIONS D8) that Manifold's design never had to make. Discord's recipients are sessions they own; those sessions don't fail for hours the way a customer's webhook URL does. Once a down endpoint can block a subscriber's queue indefinitely, "dead-letter one row and continue" vs "suspend the subscriber" becomes a real tradeoff between liveness and the ordering claim.
+
+**Expected:** the hard parts of porting would be fan-out mechanics — hashing, partition ownership, serialize-once, offload.
+
+**What actually diverged:** the failure model. The fan-out mechanism transferred; the assumption that recipients stay reachable did not. That is where the design had to leave Manifold's path.
+
+**Worth asking Discord:** whether they ever modeled long-lived recipient unavailability, or whether session ownership made it a non-issue from day one.
+
+---
+
 ## Library notes
 
 *(Empty until the scale-out phase. Expected sources of friction, to be confirmed or dismissed:)*

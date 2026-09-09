@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fold
+          POSTGRES_PASSWORD: fold
+          POSTGRES_DB: fold_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fold -d fold_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      FOLD_PG_TEST_DSN: postgres://fold:fold@localhost:5432/fold_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Invariant checks (AGENTS.md bans)
+        run: ./scripts/check-invariants.sh
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.2
+          args: ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
