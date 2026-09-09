@@ -59,15 +59,13 @@ func runOrderingRace(t *testing.T, disableHOL bool) (inversions, deliveries int)
 	}
 
 	subs := []fold.Subscriber{{ID: subID, URL: "https://example.test/hook"}}
-	for e := 0; e < events; e++ {
-		payload, _ := json.Marshal(map[string]int{"n": e})
-		if err := d.Dispatch(ctx, fold.Event{
-			ID:      fmt.Sprintf("evt-%04d", e),
-			Type:    "test.event",
-			Payload: payload,
-		}, subs); err != nil {
-			t.Fatalf("Dispatch: %v", err)
-		}
+	// Enqueue seq 1, wait for hold, then enqueue the rest so a peer can claim
+	// later sequences while seq 1 is still in flight (HOL-off tooth).
+	payload0, _ := json.Marshal(map[string]int{"n": 0})
+	if err := d.Dispatch(ctx, fold.Event{
+		ID: "evt-0000", Type: "test.event", Payload: payload0,
+	}, subs); err != nil {
+		t.Fatalf("Dispatch: %v", err)
 	}
 
 	select {
@@ -76,6 +74,17 @@ func runOrderingRace(t *testing.T, disableHOL bool) (inversions, deliveries int)
 		hold.Release()
 		_ = d.Close(context.Background())
 		t.Fatal("timed out waiting for hold on first delivery")
+	}
+
+	for e := 1; e < events; e++ {
+		payload, _ := json.Marshal(map[string]int{"n": e})
+		if err := d.Dispatch(ctx, fold.Event{
+			ID:      fmt.Sprintf("evt-%04d", e),
+			Type:    "test.event",
+			Payload: payload,
+		}, subs); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
 	}
 
 	if disableHOL {

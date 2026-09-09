@@ -51,6 +51,14 @@ func ownerID(i int) string {
 	return fmt.Sprintf("worker-%d", i)
 }
 
+func parseOwnerIndex(owner string) (int, bool) {
+	var i int
+	if _, err := fmt.Sscanf(owner, "worker-%d", &i); err != nil {
+		return 0, false
+	}
+	return i, true
+}
+
 func (o ownership) partitionsFor(owner string) []int {
 	return o.byOwner[owner]
 }
