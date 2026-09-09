@@ -71,13 +71,18 @@ What does transfer is partitioning the *sending workload* across workers with st
 
 ## Library notes
 
-*(Empty until the scale-out phase. Expected sources of friction, to be confirmed or dismissed:)*
+### L1 — Ergo can impersonate Manifold.Partitioner on OTP 29
+**What happened:** Spike under `spike/manifold-bridge/`. Elixir app depending on real `manifold` 1.7.0 called `Manifold.send/2` with a PID living on an Ergo Go node. Manifold grouped by `node(pid)` and `GenServer.cast` to `{Manifold.Partitioner, :"go@localhost"}`. Go had a process registered as `Elixir.Manifold.Partitioner` (the atom Elixir uses for that module name), handled `$gen_cast` / `{:send, pids, message}` via `erlang23.GenServer.HandleCast`, forwarded to a local receiver, and the receiver replied. Full path printed `SPIKE PROOF OK` on both sides.
 
-- The Go-side Erlang distribution library (`goerlang/node`) is old and documents missing pieces — it may not complete a handshake with a current OTP release without patching.
-- Distribution protocol handshake details are version-specific (cookie auth, capability flags), so version-matching may be fiddly.
-- Manifold's `pack_mode: :binary` assumes Erlang's External Term Format on both ends; how that interacts with a non-BEAM node is unknown.
+**Expected:** This was the hard unknown — Manifold does not send to recipient PIDs directly across the network; it addresses a named partitioner on the target node. Ergo is not a full BEAM, so name registration + GenServer cast semantics might not hold up.
 
-Do not pre-write entries here. Fill them in as they actually happen, including the ones that turn out to be non-issues.
+**What was not missing:** Registered-name delivery (`REG_SEND`), `$gen_cast` dispatch into `HandleCast`, and local `Send` to Ergo PIDs whose `node(pid)` Elixir sees as the Go node. No Manifold fork required; the Go node does not run the Manifold application — only something answering to that registered name.
+
+**Still untested:** `pack_mode: :binary` (`{:manifold_binary, bin}`), multiple partitioners (`Manifold.Partitioner_N`), `:send_mode :offload` (Sender stays on the Elixir side), and whether a fuller worker-pool impersonation is worth it vs. delivering from the partitioner itself.
+
+**Dismissed from the pre-list:** The old `goerlang/node` concern — this path uses Ergo + `erlang23` (same stack as `dist-handshake`) and completed against OTP 29 without handshake patching.
+
+Do not pre-write further entries. Fill them in as they actually happen.
 
 ---
 

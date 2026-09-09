@@ -1,0 +1,5 @@
+# Keep agent context on the library; spikes and vendored trees are noise.
+
+spike/
+vendor/
+**/node_modules/

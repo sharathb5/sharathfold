@@ -8,3 +8,8 @@
 /bin/
 /dist/
 spike/**/go-node
+manifold/**/fold-node
+
+# Elixir Mix (never commit)
+**/_build/
+**/deps/
