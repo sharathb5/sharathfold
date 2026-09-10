@@ -1,0 +1,41 @@
+fold benchmark transcript
+=========================
+
+Date:    2026-09-09
+Host:    darwin/arm64
+Go:      go1.27.1 (module declares go 1.26.1)
+Command:
+  go test ./bench/ -count=1 -timeout 30m \
+    -run 'TestLatencyVarianceSweep|TestUniformOverheadAttribution' -v
+
+Workload
+--------
+64 subscribers, 40 events (2560 deliveries), 16 workers,
+transient failure every 17th attempt.
+Latency profiles vary only slow-endpoint delay (25% of subscribers
+slow when spread > 0).
+
+Baselines: naive (shared queue, unordered), fifo (single-threaded, ordered).
+This is a local mechanism comparison — not a claim about Kafka/Svix/etc.
+
+Latency variance sweep
+----------------------
+config         fold/s   naive/s   fifo/s  foldInv  naiveInv  fifoInv
+uniform-1ms    9622.8   12413.5    644.8        0      1193        0
+spread-5ms     4951.4    6356.6    386.8        0      1166        0
+spread-12ms    2344.7    3513.0    228.1        0      1145        0
+spread-25ms    1197.6    1894.9    130.0        0      1190        0
+spread-50ms     614.9     935.5     71.3        0      1171        0
+spread-100ms    312.7     524.1     37.5        0      1176        0
+
+fold/fifo throughput: 14.92x → 12.80x → 10.28x → 9.22x → 8.62x → 8.33x
+
+Uniform overhead attribution (uniform-1ms)
+------------------------------------------
+variant        deliv/s   %naive    inv   rows/claim
+fold            9242.9      74%      0         3.7
+fold-no-HOL    11343.9      91%     85        34.3
+naive          12533.2     100%   1159        37.2
+
+Finding: HOL batch limit is real (74→91%, rows/claim 3.7→34.3 ≈ naive 37.2);
+9% residual remains after HOL is off.

@@ -13,3 +13,11 @@ manifold/**/fold-node
 # Elixir Mix (never commit)
 **/_build/
 **/deps/
+
+# Local working notes (keep on disk; do not publish)
+Agents.md
+AGENTS.md
+DECISIONS.md
+FRICTION-LOG.md
+.cursorignore
+.cursor/

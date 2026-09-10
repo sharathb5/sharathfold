@@ -3,7 +3,7 @@ package fold
 import "github.com/sharathb5/sharathfold/internal/hash"
 
 // NodeIndex returns which of nodeCount nodes owns subscriberID under the
-// multi-node assignment used by manifold/ (DECISIONS D12). Matches
+// multi-node assignment used by manifold/. Matches
 // PartitionsForNode: node i claims partitions where p % nodeCount == i.
 func NodeIndex(subscriberID string, partitions, nodeCount int) int {
 	if nodeCount <= 0 {

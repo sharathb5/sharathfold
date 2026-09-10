@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Enforce AGENTS.md bans that agents can otherwise violate with plausible code.
-# Exit non-zero on any violation. Invoked by CI; safe to run locally.
+# Enforce package-structure bans that agents/PRs can otherwise violate.
+# Exit non-zero on any violation. Invoked by CI and lefthook; safe locally.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,6 +45,15 @@ if ((${#serialize_files[@]} > 0)); then
     echo "invariant OK: no json serialization in ${serialize_files[*]}"
   else
     failed=1
+  fi
+fi
+
+# --- manifold/go is a separate module; root go test ./... never sees it --------
+if [[ -d manifold/go && -f manifold/go/go.mod ]]; then
+  if (cd manifold/go && go vet ./... && go build -o /dev/null .); then
+    echo "invariant OK: manifold/go vet + build"
+  else
+    say_fail "manifold/go vet or build failed"
   fi
 fi
 

@@ -22,7 +22,7 @@ const (
 	DefaultRetentionMaxAge   = memory.DefaultRetentionMaxAge
 	// DefaultStaleClaimAge is how old an in_flight row must be before Start's
 	// RecoverStale resets it. Must exceed DefaultDeliveryTimeout so a live
-	// attempt is not stolen mid-POST (see DECISIONS D11).
+	// attempt is not stolen mid-POST.
 	DefaultStaleClaimAge = 2 * DefaultDeliveryTimeout
 )
 
@@ -48,7 +48,7 @@ type Config struct {
 
 	// OnSuspend is called after a subscriber is suspended (retry exhaustion or
 	// permanent failure). The host app should expose this state so the
-	// subscriber can pull-resume (see DECISIONS D9).
+	// subscriber can pull-resume.
 	OnSuspend func(subscriberID string)
 
 	// DeliveryTimeout bounds each HTTP attempt. Default 30s. Ignored when
@@ -74,7 +74,7 @@ type Config struct {
 	// process's workers claim from the store. The subscriber hash space remains
 	// Partitions; only Claim is narrowed. Multi-node Manifold setups give each
 	// Go node a disjoint subset so two processes sharing Postgres are not two
-	// claimants for the same subscriber (DECISIONS D12). nil → claim the full
+	// claimants for the same subscriber. nil → claim the full
 	// space (v1 behavior).
 	PartitionsClaim []int
 
@@ -108,7 +108,7 @@ type Dispatcher struct {
 	// so every in-flight Claim finishes under the old ownership map, then the
 	// map and generation flip, then new Claims begin. Deliveries already past
 	// Claim (in deliverOne) continue under their claim-time generation — that
-	// overlap is the HOL resize window (DECISIONS D7).
+	// overlap is the HOL resize window (old owner may still be in flight).
 	claimGate sync.RWMutex
 
 	mu         sync.Mutex

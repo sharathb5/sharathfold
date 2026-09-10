@@ -30,7 +30,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Invariant checks (AGENTS.md bans)
+      - name: Invariant checks
         run: ./scripts/check-invariants.sh
 
       - name: golangci-lint
@@ -43,4 +43,15 @@ jobs:
         run: go vet ./...
 
       - name: go test
-        run: go test ./...
+        # -short skips the multi-minute latency sweep / attribution benches
+        # (results committed under results/benchmarks/). Still runs
+        # TestCompareFoldVsNaive and all package tests.
+        run: go test ./... -count=1 -short
+
+      # manifold/go is a separate module (replace → parent). Root ./... does not
+      # see it — same class of hole as a skipped Postgres suite.
+      - name: manifold/go vet and build
+        working-directory: manifold/go
+        run: |
+          go vet ./...
+          go build -o /dev/null .
