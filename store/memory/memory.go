@@ -430,8 +430,11 @@ func (s *Store) RecoverStale(ctx context.Context, olderThan time.Duration) (int,
 	return n, nil
 }
 
-// PendingOrInFlight reports how many non-terminal, non-retained deliveries remain.
-func (s *Store) PendingOrInFlight() int {
+// PendingOrInFlight implements store.PendingCounter.
+func (s *Store) PendingOrInFlight(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
@@ -440,7 +443,7 @@ func (s *Store) PendingOrInFlight() int {
 			n++
 		}
 	}
-	return n
+	return n, nil
 }
 
 // RetainedCount reports how many deliveries are held for suspended subscribers.

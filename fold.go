@@ -479,10 +479,17 @@ func (d *Dispatcher) Close(ctx context.Context) error {
 }
 
 func (d *Dispatcher) waitDrained(ctx context.Context) error {
+	if _, ok := d.store.(store.PendingCounter); !ok {
+		return fmt.Errorf("fold: store does not support drain counting (store.PendingCounter)")
+	}
 	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if d.pendingCount() == 0 {
+		n, err := d.pendingCount(ctx)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
 			return nil
 		}
 		select {
@@ -494,12 +501,12 @@ func (d *Dispatcher) waitDrained(ctx context.Context) error {
 	}
 }
 
-func (d *Dispatcher) pendingCount() int {
-	type pender interface{ PendingOrInFlight() int }
-	if p, ok := d.store.(pender); ok {
-		return p.PendingOrInFlight()
+func (d *Dispatcher) pendingCount(ctx context.Context) (int, error) {
+	p, ok := d.store.(store.PendingCounter)
+	if !ok {
+		return 0, fmt.Errorf("fold: store does not support drain counting (store.PendingCounter)")
 	}
-	return 0
+	return p.PendingOrInFlight(ctx)
 }
 
 func (d *Dispatcher) notifyCh() <-chan struct{} {

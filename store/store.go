@@ -88,3 +88,10 @@ type Store interface {
 	// RecoverStale turns in_flight rows older than age back to pending.
 	RecoverStale(ctx context.Context, olderThan time.Duration) (int, error)
 }
+
+// PendingCounter is an optional Store capability used by Dispatcher.Close to
+// wait until pending and in_flight work is gone. A Store that omits it causes
+// Close to return an error rather than silently skipping the drain wait.
+type PendingCounter interface {
+	PendingOrInFlight(ctx context.Context) (int, error)
+}

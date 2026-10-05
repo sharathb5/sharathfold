@@ -401,7 +401,11 @@ func runForcedTakeover(t *testing.T, opts forcedTakeoverOpts) (inversions, deliv
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if pg.PendingOrInFlight() == 0 {
+		n, err := pg.PendingOrInFlight(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
 			break
 		}
 		if opts.skipInFlightReset {

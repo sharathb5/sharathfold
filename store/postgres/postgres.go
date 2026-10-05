@@ -690,17 +690,20 @@ func (s *Store) BackdateClaimForTest(ctx context.Context, id string, claimedAt t
 	return nil
 }
 
-// PendingOrInFlight reports how many non-terminal, non-retained deliveries remain.
-func (s *Store) PendingOrInFlight() int {
+// PendingOrInFlight implements store.PendingCounter.
+func (s *Store) PendingOrInFlight(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	var n int
-	err := s.pool.QueryRow(context.Background(), `
+	err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM fold_deliveries
 		WHERE status IN ('pending', 'in_flight')
 	`).Scan(&n)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("postgres store: PendingOrInFlight: %w", err)
 	}
-	return n
+	return n, nil
 }
 
 // RetainedCount reports how many deliveries are held for a suspended subscriber.

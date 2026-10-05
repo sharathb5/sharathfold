@@ -64,6 +64,9 @@ func (g *gatedStore) IsSuspended(ctx context.Context, subscriberID string) (bool
 func (g *gatedStore) RecoverStale(ctx context.Context, olderThan time.Duration) (int, error) {
 	return g.inner.RecoverStale(ctx, olderThan)
 }
+func (g *gatedStore) PendingOrInFlight(ctx context.Context) (int, error) {
+	return g.inner.PendingOrInFlight(ctx)
+}
 
 func TestDispatchDoesNotInvokeTransport(t *testing.T) {
 	mem := memory.New()

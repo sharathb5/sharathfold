@@ -71,7 +71,9 @@ type crashRecoverOpts struct {
 	store   store.Store // nil → memory
 }
 
-type pender interface{ PendingOrInFlight() int }
+type pender interface {
+	PendingOrInFlight(ctx context.Context) (int, error)
+}
 
 type claimBackdater interface {
 	BackdateClaimForTest(id string, claimedAt time.Time) error
@@ -156,8 +158,14 @@ func runCrashRecover(t *testing.T, opts crashRecoverOpts) (inversions, deliverie
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if p, ok := st.(pender); ok && p.PendingOrInFlight() == 0 {
-			break
+		if p, ok := st.(pender); ok {
+			n, err := p.PendingOrInFlight(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n == 0 {
+				break
+			}
 		}
 		if !opts.recover {
 			time.Sleep(100 * time.Millisecond)
@@ -182,7 +190,11 @@ func runCrashRecover(t *testing.T, opts crashRecoverOpts) (inversions, deliverie
 	}
 	stillQueued = 0
 	if p, ok := st.(pender); ok {
-		stillQueued = p.PendingOrInFlight()
+		n, err := p.PendingOrInFlight(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stillQueued = n
 	}
 	return inversions, len(calls), stillQueued
 }
