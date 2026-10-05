@@ -26,17 +26,17 @@ sleep 0.6
 kill "$MIG" 2>/dev/null || true
 wait "$MIG" 2>/dev/null || true
 psql "$DSN" -v ON_ERROR_STOP=1 <<'SQL'
-TRUNCATE fold_deliveries, fold_subscribers, fold_subscriber_seq CASCADE;
+TRUNCATE fold_deliveries, fold_subscribers, fold_subscriber_seq, fold_partition_owners CASCADE;
 SQL
 
-echo "==> start go0 + go1"
+echo "==> start go0 + go1 (EnsureOwnerAssignments + NodeID)"
 "$ROOT/go/fold-node" -name go0@localhost -cookie "$COOKIE" -node 0 -nodes 2 -dsn "$DSN" -record -http :18080 &
 PIDS+=($!)
 "$ROOT/go/fold-node" -name go1@localhost -cookie "$COOKIE" -node 1 -nodes 2 -dsn "$DSN" -record -http :18081 &
 PIDS+=($!)
 sleep 0.8
 
-echo "==> elixir deps + Manifold fan-out"
+echo "==> elixir deps + Manifold fan-out (routes via durable ownership lookup)"
 (cd "$ROOT/elixir" && mix deps.get)
 (cd "$ROOT/elixir" && elixir --sname orch --cookie "$COOKIE" -S mix run -e 'FoldOrch.run(events: 5)')
 

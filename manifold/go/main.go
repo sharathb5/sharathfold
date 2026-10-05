@@ -1,7 +1,8 @@
-// Package main is the Go worker node for the Manifold scale-out path (D12).
+// Package main is the Go worker node for the Manifold scale-out path.
 //
 // It joins the Erlang cluster via Ergo, impersonates Manifold.Partitioner, and
-// runs fold against shared Postgres claiming only this node's partition slice.
+// runs fold against shared Postgres. Durable fold_partition_owners is
+// authoritative for Claim; Manifold only routes dispatch messages to nodes.
 package main
 
 import (
@@ -64,6 +65,12 @@ func main() {
 	}
 	defer pg.Close()
 
+	nodeID := fold.LogicalNodeID(*nodeIndex)
+	owners := fold.OwnerAssignmentsForNodes(*partitions, *nodeCount)
+	if err := store.PartitionOwnership(pg).EnsureOwnerAssignments(ctx, owners); err != nil {
+		log.Fatalf("EnsureOwnerAssignments: %v", err)
+	}
+
 	claim := fold.PartitionsForNode(*partitions, *nodeCount, *nodeIndex)
 	var inner fold.Transport
 	if *recordOnly {
@@ -78,6 +85,7 @@ func main() {
 		Workers:         *workers,
 		Partitions:      *partitions,
 		PartitionsClaim: claim,
+		NodeID:          nodeID,
 		IDPrefix:        fmt.Sprintf("n%d-", *nodeIndex),
 	})
 	if err != nil {
@@ -94,6 +102,8 @@ func main() {
 
 	b := &bridge{
 		dispatcher: d,
+		pg:         pg,
+		nodeID:     nodeID,
 		nodeIndex:  *nodeIndex,
 		nodeCount:  *nodeCount,
 		partitions: *partitions,
@@ -120,8 +130,8 @@ func main() {
 		log.Fatalf("register fold_dispatch: %v", err)
 	}
 
-	log.Printf("fold node up name=%s node=%d/%d claim=%d dispatch=%s",
-		*nodeName, *nodeIndex, *nodeCount, len(claim), dispPID)
+	log.Printf("fold node up name=%s nodeID=%s node=%d/%d claim=%d dispatch=%s",
+		*nodeName, nodeID, *nodeIndex, *nodeCount, len(claim), dispPID)
 
 	if *httpAddr != "" {
 		mux := http.NewServeMux()
@@ -132,6 +142,7 @@ func main() {
 		mux.HandleFunc("/deliveries", func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(rec.snapshot())
 		})
+		mux.HandleFunc("/ownership", b.handleOwnershipHTTP)
 		go func() {
 			log.Printf("http status on %s", *httpAddr)
 			if err := http.ListenAndServe(*httpAddr, mux); err != nil {
@@ -153,6 +164,8 @@ func envOr(k, def string) string {
 
 type bridge struct {
 	dispatcher *fold.Dispatcher
+	pg         *postgres.Store
+	nodeID     string
 	nodeIndex  int
 	nodeCount  int
 	partitions int
@@ -165,6 +178,26 @@ func (b *bridge) factoryPartitioner() gen.ProcessBehavior {
 
 func (b *bridge) factoryDispatch() gen.ProcessBehavior {
 	return &dispatchActor{bridge: b}
+}
+
+func (b *bridge) handleOwnershipHTTP(w http.ResponseWriter, r *http.Request) {
+	var part int
+	if _, err := fmt.Sscanf(r.URL.Query().Get("partition"), "%d", &part); err != nil {
+		http.Error(w, "partition query required", http.StatusBadRequest)
+		return
+	}
+	owner, state, next, gen, err := b.pg.OwnerRow(r.Context(), part)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"partition":  part,
+		"owner_node": owner,
+		"state":      state,
+		"next_owner": next,
+		"generation": gen,
+	})
 }
 
 // partitionerActor impersonates Manifold.Partitioner on this Go node.
@@ -193,7 +226,7 @@ func (p *partitionerActor) HandleCast(message any) error {
 
 func (p *partitionerActor) HandleInfo(message any) error { return nil }
 
-// dispatchActor receives {:dispatch, event, subscribers} (and pid exchange).
+// dispatchActor receives {:dispatch, event, subscribers} and ownership/handoff RPCs.
 type dispatchActor struct {
 	erlang23.GenServer
 	bridge *bridge
@@ -223,13 +256,128 @@ func (d *dispatchActor) HandleInfo(message any) error {
 
 	case "dispatch":
 		return d.handleDispatch(tuple)
+
+	case "owner_of":
+		return d.handleOwnerOf(tuple)
+
+	case "begin_handoff":
+		return d.handleBeginHandoff(tuple)
+
+	case "complete_handoff":
+		return d.handleCompleteHandoff(tuple)
+
+	case "inflight_count":
+		return d.handleInFlightCount(tuple)
 	}
+	return nil
+}
+
+func (d *dispatchActor) handleOwnerOf(tuple etf.Tuple) error {
+	// {:owner_of, partition, from_pid}
+	if len(tuple) < 3 {
+		return nil
+	}
+	part, ok := asInt(tuple.Element(2))
+	if !ok {
+		return nil
+	}
+	from, ok := tuple.Element(3).(gen.PID)
+	if !ok {
+		return nil
+	}
+	owner, state, next, generation, err := d.bridge.pg.OwnerRow(context.Background(), part)
+	if err != nil {
+		_ = d.Send(from, etf.Tuple{gen.Atom("owner_err"), etfBinary(err.Error())})
+		return nil
+	}
+	// []byte encodes as ETF binary so Elixir sees binaries, not charlists.
+	_ = d.Send(from, etf.Tuple{
+		gen.Atom("owner"),
+		part,
+		etfBinary(owner),
+		etfBinary(state),
+		etfBinary(next),
+		int64(generation),
+	})
+	return nil
+}
+
+func (d *dispatchActor) handleBeginHandoff(tuple etf.Tuple) error {
+	// {:begin_handoff, partition, from_node, to_node, from_pid}
+	if len(tuple) < 5 {
+		return nil
+	}
+	part, ok := asInt(tuple.Element(2))
+	if !ok {
+		return nil
+	}
+	fromNode, ok := asString(tuple.Element(3))
+	if !ok {
+		return nil
+	}
+	toNode, ok := asString(tuple.Element(4))
+	if !ok {
+		return nil
+	}
+	from, ok := tuple.Element(5).(gen.PID)
+	if !ok {
+		return nil
+	}
+	err := store.PartitionOwnership(d.bridge.pg).BeginHandoff(context.Background(), part, fromNode, toNode)
+	if err != nil {
+		_ = d.Send(from, etf.Tuple{gen.Atom("handoff_err"), etfBinary(err.Error())})
+		return nil
+	}
+	_ = d.Send(from, gen.Atom("handoff_ok"))
+	return nil
+}
+
+func (d *dispatchActor) handleCompleteHandoff(tuple etf.Tuple) error {
+	// {:complete_handoff, partition, from_pid}
+	if len(tuple) < 3 {
+		return nil
+	}
+	part, ok := asInt(tuple.Element(2))
+	if !ok {
+		return nil
+	}
+	from, ok := tuple.Element(3).(gen.PID)
+	if !ok {
+		return nil
+	}
+	err := store.PartitionOwnership(d.bridge.pg).CompleteHandoff(context.Background(), part)
+	if err != nil {
+		_ = d.Send(from, etf.Tuple{gen.Atom("handoff_err"), etfBinary(err.Error())})
+		return nil
+	}
+	_ = d.Send(from, gen.Atom("handoff_ok"))
+	return nil
+}
+
+func (d *dispatchActor) handleInFlightCount(tuple etf.Tuple) error {
+	// {:inflight_count, partition, from_pid}
+	if len(tuple) < 3 {
+		return nil
+	}
+	part, ok := asInt(tuple.Element(2))
+	if !ok {
+		return nil
+	}
+	from, ok := tuple.Element(3).(gen.PID)
+	if !ok {
+		return nil
+	}
+	n, err := d.bridge.pg.InFlightCount(context.Background(), part)
+	if err != nil {
+		_ = d.Send(from, etf.Tuple{gen.Atom("inflight_err"), etfBinary(err.Error())})
+		return nil
+	}
+	_ = d.Send(from, etf.Tuple{gen.Atom("inflight"), int64(n)})
 	return nil
 }
 
 func (d *dispatchActor) handleDispatch(tuple etf.Tuple) error {
 	// {:dispatch, json_binary, from_pid}
-	// json: {"event":{...},"subscribers":[{"id":"...","url":"..."}]}
 	if len(tuple) < 3 {
 		log.Printf("dispatch: short tuple len=%d", len(tuple))
 		return nil
@@ -262,9 +410,20 @@ func (d *dispatchActor) handleDispatch(tuple etf.Tuple) error {
 		subs = append(subs, fold.Subscriber{ID: s.ID, URL: s.URL})
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Accept only subscribers whose durable partition owner is this NodeID.
 	filtered := make([]fold.Subscriber, 0, len(subs))
 	for _, s := range subs {
-		if fold.NodeIndex(s.ID, d.bridge.partitions, d.bridge.nodeCount) == d.bridge.nodeIndex {
+		part := fold.NodeIndex(s.ID, d.bridge.partitions, d.bridge.partitions)
+		owner, _, _, _, err := d.bridge.pg.OwnerRow(ctx, part)
+		if err != nil {
+			log.Printf("dispatch owner lookup sub=%s part=%d: %v", s.ID, part, err)
+			replyDispatch(d, tuple, false, err.Error())
+			return nil
+		}
+		if owner == d.bridge.nodeID {
 			filtered = append(filtered, s)
 		}
 	}
@@ -273,8 +432,6 @@ func (d *dispatchActor) handleDispatch(tuple etf.Tuple) error {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	if err := d.bridge.dispatcher.Dispatch(ctx, ev, filtered); err != nil {
 		log.Printf("fold.Dispatch: %v", err)
 		replyDispatch(d, tuple, false, err.Error())
@@ -296,7 +453,7 @@ func replyDispatch(d *dispatchActor, tuple etf.Tuple, ok bool, errMsg string) {
 		}
 		return
 	}
-	_ = d.Send(from, etf.Tuple{gen.Atom("dispatch_err"), errMsg})
+	_ = d.Send(from, etf.Tuple{gen.Atom("dispatch_err"), etfBinary(errMsg)})
 }
 
 func asBytes(v any) ([]byte, error) {
@@ -307,6 +464,38 @@ func asBytes(v any) ([]byte, error) {
 		return b, nil
 	default:
 		return nil, fmt.Errorf("want binary, got %T", v)
+	}
+}
+
+// asString accepts Go string or ETF binary ([]byte) from Elixir binaries.
+func asString(v any) (string, bool) {
+	switch s := v.(type) {
+	case string:
+		return s, true
+	case []byte:
+		return string(s), true
+	default:
+		return "", false
+	}
+}
+
+// etfBinary encodes a Go string as an ETF binary (Elixir binary, not charlist).
+func etfBinary(s string) []byte {
+	return []byte(s)
+}
+
+func asInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int32:
+		return int(n), true
+	case int64:
+		return int(n), true
+	case uint64:
+		return int(n), true
+	default:
+		return 0, false
 	}
 }
 
