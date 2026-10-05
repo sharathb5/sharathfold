@@ -112,13 +112,33 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 
-// Migrate applies schema.sql.
+// migrateAdvisoryLockKey serializes schema application. Concurrent
+// CREATE TABLE IF NOT EXISTS can still race on Postgres catalog types
+// (pg_type_typname_nsp_index); multi-process Open and parallel test
+// packages both hit that path without this lock.
+const migrateAdvisoryLockKey = int64(0xF01D_541A)
+
+// Migrate applies schema.sql under an advisory lock so concurrent Open
+// callers (CI packages, multi-node boot) do not race catalog DDL.
 func (s *Store) Migrate(ctx context.Context) error {
 	ddl, err := schemaFS.ReadFile("schema.sql")
 	if err != nil {
 		return fmt.Errorf("postgres store: read schema: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, string(ddl)); err != nil {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres store: migrate acquire: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrateAdvisoryLockKey); err != nil {
+		return fmt.Errorf("postgres store: migrate lock: %w", err)
+	}
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrateAdvisoryLockKey)
+	}()
+
+	if _, err := conn.Exec(ctx, string(ddl)); err != nil {
 		return fmt.Errorf("postgres store: migrate: %w", err)
 	}
 	return nil
