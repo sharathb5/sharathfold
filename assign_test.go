@@ -37,3 +37,20 @@ func TestPartitionsForNodeDisjointCover(t *testing.T) {
 		t.Fatalf("cover %d want %d", len(seen), partitions)
 	}
 }
+
+func TestOwnerAssignmentsForNodesMatchesPartitionsForNode(t *testing.T) {
+	const partitions = 32
+	const nodes = 2
+	owners := fold.OwnerAssignmentsForNodes(partitions, nodes)
+	if len(owners) != partitions {
+		t.Fatalf("len=%d want %d", len(owners), partitions)
+	}
+	for n := 0; n < nodes; n++ {
+		id := fold.LogicalNodeID(n)
+		for _, p := range fold.PartitionsForNode(partitions, nodes, n) {
+			if owners[p] != id {
+				t.Fatalf("partition %d owner=%q want %q", p, owners[p], id)
+			}
+		}
+	}
+}

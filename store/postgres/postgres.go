@@ -5,6 +5,7 @@ import (
 	"embed"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -40,6 +41,23 @@ type Store struct {
 	// SkipSuspendGate makes Claim ignore suspension and Enqueue always insert
 	// pending rows. For invariant tests only — proves "nothing while suspended."
 	SkipSuspendGate bool
+
+	// BypassDrainingClaimGate drops only Claim's state='active' requirement
+	// while keeping the owner_node match. For the graceful-handoff tooth only.
+	BypassDrainingClaimGate bool
+
+	// SkipInFlightReset makes ForceTakeover bump ownership without resetting
+	// in_flight rows. For the forced-takeover tooth only.
+	SkipInFlightReset bool
+
+	// SkipMarkOwnerGenCheck makes Mark* ignore owner/generation match.
+	// For the stale-completion tooth only.
+	SkipMarkOwnerGenCheck bool
+
+	// distributedOwnership, when true, requires NodeID-shaped claim tokens and
+	// authorizes every Claim through fold_partition_owners. False preserves
+	// legacy single-process Postgres Claim behavior. Atomic for worker Claim races.
+	distributedOwnership atomic.Bool
 }
 
 // Open connects to Postgres and applies schema.sql.
@@ -56,7 +74,37 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
+	if err := s.refreshDistributedOwnership(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	return s, nil
+}
+
+// refreshDistributedOwnership fail-closes: any durable ownership rows enable
+// DistributedOwnership so a restarted process (or cleared in-memory flag) cannot
+// fall back to legacy Claim against an owned database.
+func (s *Store) refreshDistributedOwnership(ctx context.Context) error {
+	var n int
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM fold_partition_owners`).Scan(&n); err != nil {
+		return fmt.Errorf("postgres store: refresh DistributedOwnership: %w", err)
+	}
+	if n > 0 {
+		s.distributedOwnership.Store(true)
+	}
+	return nil
+}
+
+// HasDistributedOwnership reports whether durable ownership enforcement is on.
+func (s *Store) HasDistributedOwnership() bool {
+	return s.distributedOwnership.Load()
+}
+
+// SetDistributedOwnership sets the in-memory enforcement flag. Tests use this to
+// simulate misconfig; production callers should prefer EnsureOwners. Clearing the
+// flag does not disable enforcement while fold_partition_owners rows exist.
+func (s *Store) SetDistributedOwnership(v bool) {
+	s.distributedOwnership.Store(v)
 }
 
 // Close closes the underlying pool.
@@ -195,6 +243,12 @@ func (s *Store) Enqueue(ctx context.Context, ds []store.Delivery) error {
 }
 
 // Claim implements store.Store with partition scoping and head-of-line gating.
+//
+// When DistributedOwnership is false (legacy single-process), Claim uses the
+// caller partition list and generation. When true, every Claim is authorized
+// only through fold_partition_owners for a NodeID/incarnation/worker-N token;
+// the partitions argument is ignored so a stale PartitionsClaim cannot strand
+// work after handoff.
 func (s *Store) Claim(ctx context.Context, owner string, generation uint64, partitions []int, limit int) ([]store.Delivery, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -205,7 +259,14 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 	if generation == 0 {
 		return nil, fmt.Errorf("postgres store: claim requires non-zero generation")
 	}
-	if limit <= 0 || len(partitions) == 0 {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if err := s.refreshDistributedOwnership(ctx); err != nil {
+		return nil, err
+	}
+	distributed := s.distributedOwnership.Load()
+	if !distributed && len(partitions) == 0 {
 		return nil, nil
 	}
 
@@ -231,34 +292,83 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 		suspendClause = ""
 	}
 
-	query := fmt.Sprintf(`
-		WITH candidates AS (
-			SELECT d.id
-			FROM fold_deliveries d
-			WHERE d.partition = ANY($1::int[])
-			  AND d.status = 'pending'
-			  AND d.next_attempt_at <= now()
-			  %s
-			  %s
-			ORDER BY d.partition, d.subscriber_id, d.sequence
-			LIMIT $2
-			FOR UPDATE OF d SKIP LOCKED
-		)
-		UPDATE fold_deliveries d
-		SET status = 'in_flight',
-		    owner = $3,
-		    generation = $4,
-		    claimed_at = now(),
-		    attempt = d.attempt + 1
-		FROM candidates c
-		WHERE d.id = c.id
-		RETURNING
-			d.id, d.event_id, d.subscriber_id, d.url, d.partition, d.sequence,
-			d.payload, d.event_type, d.status, d.attempt, d.next_attempt_at,
-			d.last_error, d.owner, d.generation, d.claimed_at, d.created_at, d.secret
-	`, suspendClause, holClause)
+	var (
+		query string
+		args  []any
+	)
+	if distributed {
+		logicalNode, ok := parseDistributedOwner(owner)
+		if !ok {
+			return nil, fmt.Errorf("postgres store: distributed Claim requires NodeID/incarnation/worker-N owner, got %q", owner)
+		}
+		if err := s.checkOwnershipMetadata(ctx); err != nil {
+			return nil, err
+		}
+		stateClause := `AND po.state = 'active'`
+		if s.BypassDrainingClaimGate {
+			stateClause = ""
+		}
+		// Durable ownership is the source of truth for claimable partitions.
+		query = fmt.Sprintf(`
+			WITH candidates AS (
+				SELECT d.id, po.generation AS own_gen
+				FROM fold_deliveries d
+				INNER JOIN fold_partition_owners po ON po.partition = d.partition
+				WHERE d.status = 'pending'
+				  AND d.next_attempt_at <= now()
+				  AND po.owner_node = $1
+				  %s
+				  %s
+				  %s
+				ORDER BY d.partition, d.subscriber_id, d.sequence
+				LIMIT $2
+				FOR UPDATE OF d SKIP LOCKED
+			)
+			UPDATE fold_deliveries d
+			SET status = 'in_flight',
+			    owner = $3,
+			    generation = c.own_gen,
+			    claimed_at = now(),
+			    attempt = d.attempt + 1
+			FROM candidates c
+			WHERE d.id = c.id
+			RETURNING
+				d.id, d.event_id, d.subscriber_id, d.url, d.partition, d.sequence,
+				d.payload, d.event_type, d.status, d.attempt, d.next_attempt_at,
+				d.last_error, d.owner, d.generation, d.claimed_at, d.created_at, d.secret
+		`, stateClause, suspendClause, holClause)
+		args = []any{logicalNode, limit, owner}
+	} else {
+		query = fmt.Sprintf(`
+			WITH candidates AS (
+				SELECT d.id
+				FROM fold_deliveries d
+				WHERE d.partition = ANY($1::int[])
+				  AND d.status = 'pending'
+				  AND d.next_attempt_at <= now()
+				  %s
+				  %s
+				ORDER BY d.partition, d.subscriber_id, d.sequence
+				LIMIT $2
+				FOR UPDATE OF d SKIP LOCKED
+			)
+			UPDATE fold_deliveries d
+			SET status = 'in_flight',
+			    owner = $3,
+			    generation = $4,
+			    claimed_at = now(),
+			    attempt = d.attempt + 1
+			FROM candidates c
+			WHERE d.id = c.id
+			RETURNING
+				d.id, d.event_id, d.subscriber_id, d.url, d.partition, d.sequence,
+				d.payload, d.event_type, d.status, d.attempt, d.next_attempt_at,
+				d.last_error, d.owner, d.generation, d.claimed_at, d.created_at, d.secret
+		`, suspendClause, holClause)
+		args = []any{partitions, limit, owner, int64(generation)}
+	}
 
-	rows, err := s.pool.Query(ctx, query, partitions, limit, owner, int64(generation))
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("postgres store: claim: %w", err)
 	}
@@ -276,6 +386,30 @@ func (s *Store) Claim(ctx context.Context, owner string, generation uint64, part
 		return nil, err
 	}
 	return out, nil
+}
+
+func (s *Store) checkOwnershipMetadata(ctx context.Context) error {
+	var owners int
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM fold_partition_owners`).Scan(&owners); err != nil {
+		return fmt.Errorf("postgres store: ownership metadata lookup: %w", err)
+	}
+	if owners == 0 {
+		return fmt.Errorf("postgres store: DistributedOwnership enabled but fold_partition_owners is empty")
+	}
+	var missing int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM fold_deliveries d
+		WHERE d.status IN ('pending', 'in_flight')
+		  AND NOT EXISTS (
+			SELECT 1 FROM fold_partition_owners po WHERE po.partition = d.partition
+		  )
+	`).Scan(&missing); err != nil {
+		return fmt.Errorf("postgres store: ownership metadata check: %w", err)
+	}
+	if missing > 0 {
+		return fmt.Errorf("postgres store: %d deliveries lack fold_partition_owners metadata", missing)
+	}
+	return nil
 }
 
 // MarkDelivered implements store.Store.
@@ -296,24 +430,45 @@ func (s *Store) MarkFailed(ctx context.Context, id string, owner string, generat
 	if generation == 0 {
 		return fmt.Errorf("postgres store: mark requires non-zero generation")
 	}
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE fold_deliveries
-		SET status = 'pending',
-		    attempt = $4,
-		    next_attempt_at = $5,
-		    last_error = $6,
-		    owner = NULL,
-		    generation = 0,
-		    claimed_at = NULL
-		WHERE id = $1
-		  AND status = 'in_flight'
-		  AND owner = $2
-		  AND generation = $3
-	`, id, owner, int64(generation), attempt, next.UTC(), errMsg)
-	if err != nil {
-		return fmt.Errorf("postgres store: mark failed: %w", err)
+	var (
+		affected int64
+		execErr  error
+	)
+	if s.SkipMarkOwnerGenCheck {
+		tag, err := s.pool.Exec(ctx, `
+			UPDATE fold_deliveries
+			SET status = 'pending',
+			    attempt = $2,
+			    next_attempt_at = $3,
+			    last_error = $4,
+			    owner = NULL,
+			    generation = 0,
+			    claimed_at = NULL
+			WHERE id = $1
+			  AND status = 'in_flight'
+		`, id, attempt, next.UTC(), errMsg)
+		affected, execErr = tag.RowsAffected(), err
+	} else {
+		tag, err := s.pool.Exec(ctx, `
+			UPDATE fold_deliveries
+			SET status = 'pending',
+			    attempt = $4,
+			    next_attempt_at = $5,
+			    last_error = $6,
+			    owner = NULL,
+			    generation = 0,
+			    claimed_at = NULL
+			WHERE id = $1
+			  AND status = 'in_flight'
+			  AND owner = $2
+			  AND generation = $3
+		`, id, owner, int64(generation), attempt, next.UTC(), errMsg)
+		affected, execErr = tag.RowsAffected(), err
 	}
-	if tag.RowsAffected() == 0 {
+	if execErr != nil {
+		return fmt.Errorf("postgres store: mark failed: %w", execErr)
+	}
+	if affected == 0 {
 		return fmt.Errorf("postgres store: stale claim on %s (owner/generation mismatch)", id)
 	}
 	s.signal()
@@ -336,19 +491,33 @@ func (s *Store) ExhaustAndSuspend(ctx context.Context, id string, owner string, 
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var subID string
-	err = tx.QueryRow(ctx, `
-		UPDATE fold_deliveries
-		SET status = 'dead_lettered',
-		    last_error = $4,
-		    owner = NULL,
-		    generation = 0,
-		    claimed_at = NULL
-		WHERE id = $1
-		  AND status = 'in_flight'
-		  AND owner = $2
-		  AND generation = $3
-		RETURNING subscriber_id
-	`, id, owner, int64(generation), errMsg).Scan(&subID)
+	if s.SkipMarkOwnerGenCheck {
+		err = tx.QueryRow(ctx, `
+			UPDATE fold_deliveries
+			SET status = 'dead_lettered',
+			    last_error = $2,
+			    owner = NULL,
+			    generation = 0,
+			    claimed_at = NULL
+			WHERE id = $1
+			  AND status = 'in_flight'
+			RETURNING subscriber_id
+		`, id, errMsg).Scan(&subID)
+	} else {
+		err = tx.QueryRow(ctx, `
+			UPDATE fold_deliveries
+			SET status = 'dead_lettered',
+			    last_error = $4,
+			    owner = NULL,
+			    generation = 0,
+			    claimed_at = NULL
+			WHERE id = $1
+			  AND status = 'in_flight'
+			  AND owner = $2
+			  AND generation = $3
+			RETURNING subscriber_id
+		`, id, owner, int64(generation), errMsg).Scan(&subID)
+	}
 	if err == pgx.ErrNoRows {
 		return fmt.Errorf("postgres store: stale claim on %s (owner/generation mismatch)", id)
 	}
@@ -551,22 +720,42 @@ func (s *Store) markTerminal(ctx context.Context, id, owner string, generation u
 	if generation == 0 {
 		return fmt.Errorf("postgres store: mark requires non-zero generation")
 	}
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE fold_deliveries
-		SET status = $4,
-		    last_error = $5,
-		    owner = NULL,
-		    generation = 0,
-		    claimed_at = NULL
-		WHERE id = $1
-		  AND status = 'in_flight'
-		  AND owner = $2
-		  AND generation = $3
-	`, id, owner, int64(generation), string(status), errMsg)
-	if err != nil {
-		return fmt.Errorf("postgres store: mark terminal: %w", err)
+	var (
+		affected int64
+		execErr  error
+	)
+	if s.SkipMarkOwnerGenCheck {
+		// Tooth path: omit owner/generation so unused $params do not break pgx typing.
+		tag, err := s.pool.Exec(ctx, `
+			UPDATE fold_deliveries
+			SET status = $2,
+			    last_error = $3,
+			    owner = NULL,
+			    generation = 0,
+			    claimed_at = NULL
+			WHERE id = $1
+			  AND status = 'in_flight'
+		`, id, string(status), errMsg)
+		affected, execErr = tag.RowsAffected(), err
+	} else {
+		tag, err := s.pool.Exec(ctx, `
+			UPDATE fold_deliveries
+			SET status = $4,
+			    last_error = $5,
+			    owner = NULL,
+			    generation = 0,
+			    claimed_at = NULL
+			WHERE id = $1
+			  AND status = 'in_flight'
+			  AND owner = $2
+			  AND generation = $3
+		`, id, owner, int64(generation), string(status), errMsg)
+		affected, execErr = tag.RowsAffected(), err
 	}
-	if tag.RowsAffected() == 0 {
+	if execErr != nil {
+		return fmt.Errorf("postgres store: mark terminal: %w", execErr)
+	}
+	if affected == 0 {
 		return fmt.Errorf("postgres store: stale claim on %s (owner/generation mismatch)", id)
 	}
 	s.signal()
@@ -711,9 +900,13 @@ func scanDelivery(row scannable) (store.Delivery, error) {
 // TruncateForTest wipes all fold tables. For tests only.
 func (s *Store) TruncateForTest(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
-		TRUNCATE fold_deliveries, fold_subscribers, fold_subscriber_seq
+		TRUNCATE fold_deliveries, fold_subscribers, fold_subscriber_seq, fold_partition_owners
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	s.distributedOwnership.Store(false)
+	return nil
 }
 
 // testAdvisoryLockKey serializes packages that share the fold_test database.

@@ -2,9 +2,12 @@ package fold
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,6 +85,20 @@ type Config struct {
 	// claimed_at older than this are reset to pending. Zero selects
 	// DefaultStaleClaimAge. Negative disables recovery (tests only).
 	StaleClaimAge time.Duration
+
+	// NodeID is the stable logical node name used for durable partition
+	// ownership (fold_partition_owners.owner_node). Required when the store
+	// has DistributedOwnership enabled; forbidden to contain '/'. When set,
+	// claim owners become NodeID/IncarnationID/worker-N. Empty is legacy
+	// single-process mode (worker-N tokens) and requires DistributedOwnership
+	// to be off.
+	NodeID string
+}
+
+// distributedOwnershipStore is implemented by store/postgres when durable
+// cross-process ownership enforcement is enabled.
+type distributedOwnershipStore interface {
+	HasDistributedOwnership() bool
 }
 
 // ResumeResult is returned by Dispatcher.Resume.
@@ -126,6 +143,9 @@ type Dispatcher struct {
 	idSeq    atomic.Uint64
 	idPrefix string
 
+	nodeID        string
+	incarnationID string
+
 	// Per-owner delivery/idle counters for load-balance diagnostics.
 	workerStats sync.Map // owner string -> *workerCounters
 }
@@ -144,24 +164,6 @@ func New(cfg Config) (*Dispatcher, error) {
 	if partitions <= 0 {
 		partitions = hash.DefaultPartitions
 	}
-	own, err := buildOwnership(workers, partitions, cfg.OverlapPartitions, cfg.PartitionsClaim)
-	if err != nil {
-		return nil, err
-	}
-
-	maxAttempts := cfg.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = DefaultMaxAttempts
-	}
-	baseBackoff := cfg.BaseBackoff
-	if baseBackoff <= 0 {
-		baseBackoff = DefaultBaseBackoff
-	}
-	maxBackoff := cfg.MaxBackoff
-	if maxBackoff <= 0 {
-		maxBackoff = DefaultMaxBackoff
-	}
-
 	st := cfg.Store
 	var mem *memory.Store
 	if st == nil {
@@ -179,6 +181,45 @@ func New(cfg Config) (*Dispatcher, error) {
 		}
 	}
 
+	distributed := false
+	if d, ok := st.(distributedOwnershipStore); ok {
+		distributed = d.HasDistributedOwnership()
+	}
+
+	nodeID := cfg.NodeID
+	if strings.Contains(nodeID, "/") {
+		return nil, fmt.Errorf("fold: NodeID must not contain '/'")
+	}
+	if distributed && nodeID == "" {
+		return nil, fmt.Errorf("fold: NodeID required when DistributedOwnership is enabled")
+	}
+	if !distributed && nodeID != "" {
+		return nil, fmt.Errorf("fold: NodeID requires DistributedOwnership on the store (call EnsureOwners or set the flag)")
+	}
+
+	incarnationID := ""
+	if nodeID != "" {
+		incarnationID = newIncarnationID()
+	}
+
+	own, err := buildOwnership(workers, partitions, cfg.OverlapPartitions, cfg.PartitionsClaim, nodeID, incarnationID)
+	if err != nil {
+		return nil, err
+	}
+
+	maxAttempts := cfg.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultMaxAttempts
+	}
+	baseBackoff := cfg.BaseBackoff
+	if baseBackoff <= 0 {
+		baseBackoff = DefaultBaseBackoff
+	}
+	maxBackoff := cfg.MaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = DefaultMaxBackoff
+	}
+
 	return &Dispatcher{
 		store:         st,
 		transport:     transport,
@@ -192,7 +233,19 @@ func New(cfg Config) (*Dispatcher, error) {
 		onSuspend:     cfg.OnSuspend,
 		staleClaimAge: cfg.StaleClaimAge,
 		idPrefix:      cfg.IDPrefix,
+		nodeID:        nodeID,
+		incarnationID: incarnationID,
 	}, nil
+}
+
+func newIncarnationID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failure is effectively impossible; fall back so New
+		// still returns a distinct-enough token per process.
+		return fmt.Sprintf("inc-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // Start runs RecoverStale, then launches the worker pool.
@@ -219,7 +272,7 @@ func (d *Dispatcher) Start(ctx context.Context) error {
 	d.started = true
 
 	for w := 0; w < d.workers; w++ {
-		d.spawnWorkerLocked(ownerID(w))
+		d.spawnWorkerLocked(claimOwnerID(d.nodeID, d.incarnationID, w))
 	}
 	go func() {
 		d.workerWG.Wait()
@@ -272,7 +325,7 @@ func (d *Dispatcher) Resize(ctx context.Context, workers int) error {
 		return nil
 	}
 
-	newOwn, err := buildOwnership(workers, d.own.partitions, false, nil)
+	newOwn, err := buildOwnership(workers, d.own.partitions, false, nil, d.nodeID, d.incarnationID)
 	if err != nil {
 		return err
 	}
@@ -284,7 +337,7 @@ func (d *Dispatcher) Resize(ctx context.Context, workers int) error {
 
 	// Grow: spawn owners that did not exist under the old count.
 	for w := oldWorkers; w < workers; w++ {
-		d.spawnWorkerLocked(ownerID(w))
+		d.spawnWorkerLocked(claimOwnerID(d.nodeID, d.incarnationID, w))
 	}
 	// Shrink: excess workers see index >= d.workers and exit their claim loop.
 	return nil

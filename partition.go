@@ -2,6 +2,7 @@ package fold
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/sharathb5/sharathfold/internal/hash"
 )
@@ -17,7 +18,7 @@ type ownership struct {
 	narrowed bool
 }
 
-func buildOwnership(workers, partitions int, overlap bool, claim []int) (ownership, error) {
+func buildOwnership(workers, partitions int, overlap bool, claim []int, nodeID, incarnation string) (ownership, error) {
 	if workers <= 0 {
 		return ownership{}, fmt.Errorf("fold: Workers must be >= 1")
 	}
@@ -53,7 +54,7 @@ func buildOwnership(workers, partitions int, overlap bool, claim []int) (ownersh
 		narrowed:   narrowed,
 	}
 	for w := 0; w < workers; w++ {
-		id := ownerID(w)
+		id := claimOwnerID(nodeID, incarnation, w)
 		parts := make([]int, 0, (len(universe)/workers)+1)
 		if overlap {
 			parts = append(parts, universe...)
@@ -74,12 +75,33 @@ func ownerID(i int) string {
 	return fmt.Sprintf("worker-%d", i)
 }
 
+// claimOwnerID is the store Claim/Mark owner token. With NodeID set it embeds
+// the process incarnation so a restarted logical node cannot reuse stamps.
+func claimOwnerID(nodeID, incarnation string, w int) string {
+	if nodeID == "" {
+		return ownerID(w)
+	}
+	return fmt.Sprintf("%s/%s/worker-%d", nodeID, incarnation, w)
+}
+
 func parseOwnerIndex(owner string) (int, bool) {
-	var i int
-	if _, err := fmt.Sscanf(owner, "worker-%d", &i); err != nil {
+	const prefix = "worker-"
+	i := strings.LastIndex(owner, prefix)
+	if i < 0 {
 		return 0, false
 	}
-	return i, true
+	if i > 0 && owner[i-1] != '/' {
+		return 0, false
+	}
+	rest := owner[i:]
+	var n int
+	if _, err := fmt.Sscanf(rest, "worker-%d", &n); err != nil {
+		return 0, false
+	}
+	if rest != fmt.Sprintf("worker-%d", n) {
+		return 0, false
+	}
+	return n, true
 }
 
 func (o ownership) partitionsFor(owner string) []int {

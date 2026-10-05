@@ -44,3 +44,19 @@ CREATE INDEX IF NOT EXISTS fold_claim_idx
 
 CREATE INDEX IF NOT EXISTS fold_subscriber_status_idx
     ON fold_deliveries (subscriber_id, status, sequence);
+
+-- Authoritative cross-process partition ownership (logical node, not claim token).
+CREATE TABLE IF NOT EXISTS fold_partition_owners (
+    partition   INT PRIMARY KEY,
+    owner_node  TEXT NOT NULL,
+    generation  BIGINT NOT NULL,
+    state       TEXT NOT NULL,
+    next_owner  TEXT,
+    CONSTRAINT fold_partition_owners_state_check
+        CHECK (state IN ('active', 'draining')),
+    CONSTRAINT fold_partition_owners_next_check
+        CHECK (
+            (state = 'active' AND next_owner IS NULL) OR
+            (state = 'draining' AND next_owner IS NOT NULL)
+        )
+);
