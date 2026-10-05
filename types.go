@@ -1,6 +1,9 @@
 package fold
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // Event is a single webhook event accepted by Dispatch.
 type Event struct {
@@ -29,3 +32,19 @@ const (
 	StatusDeadLettered DeliveryStatus = "dead_lettered"
 	StatusRetained     DeliveryStatus = "retained"
 )
+
+// DeliveryMutationError is a failed post-Deliver store transition. The HTTP
+// attempt may already have succeeded or failed; the store row may be unchanged.
+type DeliveryMutationError struct {
+	Op           string // MarkDelivered, MarkFailed, ExhaustAndSuspend
+	DeliveryID   string
+	SubscriberID string
+	EventID      string
+	Err          error
+}
+
+func (e DeliveryMutationError) Error() string {
+	return fmt.Sprintf("fold: %s %s: %v", e.Op, e.DeliveryID, e.Err)
+}
+
+func (e DeliveryMutationError) Unwrap() error { return e.Err }

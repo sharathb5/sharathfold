@@ -113,11 +113,13 @@ func (d *Dispatcher) claimBatch(ctx context.Context, owner string) ([]store.Deli
 func (d *Dispatcher) deliverOne(ctx context.Context, owner string, del store.Delivery) {
 	res := d.transport.Deliver(ctx, del)
 	// Marks use claim-time generation so an in-flight delivery can complete
-	// after Resize bumps the dispatcher's generation (D7 handoff window).
+	// after Resize bumps the dispatcher's generation (HOL resize/handoff window).
 	gen := del.Generation
 	switch res.Outcome {
 	case OutcomeSuccess:
-		_ = d.store.MarkDelivered(ctx, del.ID, owner, gen)
+		if err := d.store.MarkDelivered(ctx, del.ID, owner, gen); err != nil {
+			d.reportDeliveryError("MarkDelivered", del, err)
+		}
 	case OutcomePermanent:
 		d.exhaust(ctx, owner, del, res.Error())
 	default:
@@ -126,17 +128,33 @@ func (d *Dispatcher) deliverOne(ctx context.Context, owner string, del store.Del
 			return
 		}
 		next := time.Now().Add(backoff.Delay(del.Attempt, d.baseBackoff, d.maxBackoff))
-		_ = d.store.MarkFailed(ctx, del.ID, owner, gen, del.Attempt, next, res.Error())
+		if err := d.store.MarkFailed(ctx, del.ID, owner, gen, del.Attempt, next, res.Error()); err != nil {
+			d.reportDeliveryError("MarkFailed", del, err)
+		}
 	}
 }
 
 func (d *Dispatcher) exhaust(ctx context.Context, owner string, del store.Delivery, errMsg string) {
 	if err := d.store.ExhaustAndSuspend(ctx, del.ID, owner, del.Generation, errMsg); err != nil {
+		d.reportDeliveryError("ExhaustAndSuspend", del, err)
 		return
 	}
 	if d.onSuspend != nil {
 		d.onSuspend(del.SubscriberID)
 	}
+}
+
+func (d *Dispatcher) reportDeliveryError(op string, del store.Delivery, err error) {
+	if d.onDeliveryError == nil || err == nil {
+		return
+	}
+	d.onDeliveryError(DeliveryMutationError{
+		Op:           op,
+		DeliveryID:   del.ID,
+		SubscriberID: del.SubscriberID,
+		EventID:      del.EventID,
+		Err:          err,
+	})
 }
 
 func (d *Dispatcher) waitForWork(ctx context.Context, idle *time.Timer, stats *workerCounters) bool {

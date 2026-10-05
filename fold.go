@@ -54,6 +54,15 @@ type Config struct {
 	// subscriber can pull-resume.
 	OnSuspend func(subscriberID string)
 
+	// OnDeliveryError is called when a post-Deliver store mutation fails
+	// (MarkDelivered, MarkFailed, or ExhaustAndSuspend). The transport attempt
+	// may already have completed; fold does not retry the mutation.
+	//
+	// Err may be a legitimate fencing rejection (stale owner/generation after
+	// ForceTakeover or resize) or a store/backend failure. Both are surfaced;
+	// they are not equivalent — inspect Err.
+	OnDeliveryError func(DeliveryMutationError)
+
 	// DeliveryTimeout bounds each HTTP attempt. Default 30s. Ignored when
 	// Transport is supplied by the caller.
 	DeliveryTimeout time.Duration
@@ -62,9 +71,9 @@ type Config struct {
 	// client with connection reuse. Ignored when Transport is set.
 	HTTPClient *http.Client
 
-	// IDPrefix, when set, is prepended to generated delivery IDs. Multi-node
-	// setups that share a store must use distinct prefixes so Enqueue does not
-	// collide on primary key. Empty preserves v1 IDs (dlg_<n>).
+	// IDPrefix, when set, is prepended to generated delivery IDs. Optional
+	// operator tag only — IDs are cryptographically random and safe across
+	// restart and multi-process sharing without a unique prefix.
 	IDPrefix string
 
 	// OverlapPartitions gives every worker every partition. Production leaves
@@ -114,10 +123,11 @@ type Dispatcher struct {
 	transport Transport
 	mem       *memory.Store
 
-	maxAttempts int
-	baseBackoff time.Duration
-	maxBackoff  time.Duration
-	onSuspend   func(subscriberID string)
+	maxAttempts     int
+	baseBackoff     time.Duration
+	maxBackoff      time.Duration
+	onSuspend       func(subscriberID string)
+	onDeliveryError func(DeliveryMutationError)
 
 	staleClaimAge time.Duration // <0 disables; 0 means use DefaultStaleClaimAge at New
 
@@ -140,8 +150,8 @@ type Dispatcher struct {
 	workerWG     sync.WaitGroup
 	workerDone   chan struct{}
 
-	idSeq    atomic.Uint64
-	idPrefix string
+	idPrefix   string
+	idFallback atomic.Uint64 // only if crypto/rand fails
 
 	nodeID        string
 	incarnationID string
@@ -221,20 +231,21 @@ func New(cfg Config) (*Dispatcher, error) {
 	}
 
 	return &Dispatcher{
-		store:         st,
-		transport:     transport,
-		mem:           mem,
-		own:           own,
-		generation:    1,
-		workers:       workers,
-		maxAttempts:   maxAttempts,
-		baseBackoff:   baseBackoff,
-		maxBackoff:    maxBackoff,
-		onSuspend:     cfg.OnSuspend,
-		staleClaimAge: cfg.StaleClaimAge,
-		idPrefix:      cfg.IDPrefix,
-		nodeID:        nodeID,
-		incarnationID: incarnationID,
+		store:           st,
+		transport:       transport,
+		mem:             mem,
+		own:             own,
+		generation:      1,
+		workers:         workers,
+		maxAttempts:     maxAttempts,
+		baseBackoff:     baseBackoff,
+		maxBackoff:      maxBackoff,
+		onSuspend:       cfg.OnSuspend,
+		onDeliveryError: cfg.OnDeliveryError,
+		staleClaimAge:   cfg.StaleClaimAge,
+		idPrefix:        cfg.IDPrefix,
+		nodeID:          nodeID,
+		incarnationID:   incarnationID,
 	}, nil
 }
 
@@ -412,7 +423,7 @@ func (d *Dispatcher) Suspended(ctx context.Context, subscriberID string) (bool, 
 }
 
 // Resume clears suspension for subscriberID and requeues retained deliveries
-// for ordered replay. Reports whether a retention gap occurred (D10).
+// for ordered replay. Reports whether retention dropped events while suspended.
 func (d *Dispatcher) Resume(ctx context.Context, subscriberID string) (ResumeResult, error) {
 	if subscriberID == "" {
 		return ResumeResult{}, fmt.Errorf("fold: subscriber ID required")
@@ -500,11 +511,13 @@ func (d *Dispatcher) notifyCh() <-chan struct{} {
 }
 
 func (d *Dispatcher) nextID() string {
-	n := d.idSeq.Add(1)
-	if d.idPrefix != "" {
-		return fmt.Sprintf("%sdlg_%d", d.idPrefix, n)
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failure is effectively impossible; fall back to a
+		// process-unique token that still avoids the old dlg_<n> restart clash.
+		return d.idPrefix + fmt.Sprintf("dlg-%d-%d", time.Now().UnixNano(), d.idFallback.Add(1))
 	}
-	return fmt.Sprintf("dlg_%d", n)
+	return d.idPrefix + hex.EncodeToString(b[:])
 }
 
 func encodeOnce(ev Event) ([]byte, error) {
