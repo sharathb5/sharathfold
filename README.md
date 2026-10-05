@@ -39,7 +39,7 @@ flowchart TB
   HTTP --> Subs["Subscriber endpoints"]
 ```
 
-Dispatch path (returns when rows are durable in the store):
+Dispatch path (returns after rows are enqueued in the configured store; Postgres commits before return):
 
 1. Host calls `Dispatch` with an event and subscribers.
 2. Payload is JSON-encoded once; bytes are shared read-only across that event's deliveries.
@@ -73,6 +73,7 @@ Hashing onto worker count remaps nearly every subscriber when the pool grows or 
 3. **HOL gate.** A delivery is claimable only when no earlier-sequence row for that subscriber is still pending or in flight. Tests assert zero inversions with the gate on and nonzero with it off (peer race via overlapped ownership; same-owner skip-ahead via failure injection).
 4. **Suspend.** After retries are exhausted (or a permanent failure), the subscriber is suspended: nothing further is delivered, remaining backlog is retained up to configured bounds — not shuffled onward.
 5. **Resume.** Host-driven, pull-based. Resume clears suspension and replays retained rows in sequence order. If retention overflowed, resume reports a gap and a marker. Fold does not invent the host's event-history API.
+6. Optional `OnDeliveryError` reports failed delivery-state mutations, including stale fencing failures and store errors.
 
 Resize bumps a generation stamp so drained workers cannot complete under a stale ownership map. On `Start`, claims older than `StaleClaimAge` (default `2 × DeliveryTimeout`) are reset to pending.
 
@@ -187,7 +188,7 @@ func main() {
 }
 ```
 
-Default store is in-memory; pass `store/postgres` for durability. Default transport is HTTP with optional `Fold-Signature` when `Subscriber.Secret` is set.
+Default store is in-memory; pass `store/postgres` for durability. Default transport is HTTP with optional `Fold-Signature` when `Subscriber.Secret` is set. Generated delivery IDs are restart-safe and process-independent; `IDPrefix` is an optional tag only.
 
 ```bash
 go test ./...
@@ -218,7 +219,7 @@ Unit tests live next to the packages they cover (Go convention). Postgres / mult
 
 ## Design tradeoffs
 
-- Default is single-process. Multi-node uses static partition slices today; live rebalance across Go nodes is unfinished.
+- Default is single-process. Multi-node supports explicit live partition handoff through Postgres. Automatic rebalance, membership discovery, and lease-based failover are out of scope.
 - Ordering and benches assume a cooperative local setup (in-process or one Postgres). Multi-region and network partitions are out of scope.
 - Suspend/resume is safe by construction when suspension runs after `Deliver` under one lock; host-initiated suspend mid-flight is not covered by that proof.
 - Benchmarks compare mechanisms in-process against sketch baselines, not tuned production fleets.
@@ -232,7 +233,7 @@ golangci-lint run ./...          # if installed; also in CI
 go test ./bench/ -run 'TestLatencyVarianceSweep|TestUniformOverheadAttribution' -v
 ```
 
-CI runs the same invariants, `go vet`, tests with `-short` (with Postgres service), and `manifold/go` vet/build.
+CI runs the same invariants, `go vet`, tests with `-short` (with Postgres service), and `manifold/go` vet/build. Postgres schema migrate is serialized with an advisory lock so parallel packages and multi-process `Open` do not race catalog DDL.
 
 ## License
 
