@@ -76,6 +76,8 @@ Hashing onto worker count remaps nearly every subscriber when the pool grows or 
 
 Resize bumps a generation stamp so drained workers cannot complete under a stale ownership map. On `Start`, claims older than `StaleClaimAge` (default `2 × DeliveryTimeout`) are reset to pending.
 
+Cross-process partition handoff (Postgres only) is an explicit mode (`DistributedOwnership`, enabled by `EnsureOwners` or by detecting durable `fold_partition_owners` rows on Open/Claim) using `store.PartitionOwnership` (`BeginHandoff` / `CompleteHandoff` / `ForceTakeover`). With ownership rows present, every Claim is authorized through the table (`NodeID` required, no `/`); legacy Claim remains only when the table is empty and the mode is off. Graceful handoff drains before transfer; forced takeover fences durable store state only — an in-flight HTTP POST may still complete and surface as a duplicate or wire-visible reorder.
+
 ## Benchmarks
 
 Local mechanism comparison (not a production bake-off against Kafka, Svix, etc.): 64 subscribers, 40 events (2560 deliveries), 16 workers, transient failure every 17th attempt. Baselines: `naive` (shared queue, unordered) and `fifo` (single-threaded, ordered).
@@ -120,13 +122,15 @@ flowchart LR
 ```
 
 - Go nodes join the cluster via Ergo (`erlang23`) and register as `Elixir.Manifold.Partitioner`.
-- Real, unmodified Manifold routes by `node(pid)`.
-- **Manifold decides where** (which Go node owns which subscriber).
-- **fold decides when** (HOL, retries, suspend/resume) on shared Postgres with disjoint `PartitionsClaim`.
+- Real, unmodified Manifold performs cross-node sends to Go `fold_dispatch` PIDs.
+- **fold assignment / `fold_partition_owners`** determines which logical `NodeID` owns delivery work (Claim).
+- **Manifold** only routes orchestrator-chosen dispatch messages over Erlang distribution.
+- Live handoff is coordinated through Postgres (`BeginHandoff` / `CompleteHandoff`); the orchestrator re-reads ownership so later routes follow the new owner. No auto-rebalance.
 - No Manifold or Ergo fork. Dispatch payloads use a JSON binary; nested ETF maps did not round-trip reliably into Ergo.
 
 ```bash
-./manifold/run.sh   # epmd, Elixir, Postgres; see manifold/
+./manifold/run.sh          # fan-out across go0/go1
+./manifold/run_handoff.sh  # graceful handoff go0→go1 over Manifold
 ```
 
 ## Quick start
